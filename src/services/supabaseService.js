@@ -61,24 +61,45 @@ const buildFilters = (query) => {
 const UserService = {
   async findByEmail(email) {
     const client = getClient();
-    const { data, error } = await client
-      .from(SUPABASE_TABLES.profiles)
-      .select('*')
-      .eq('email', email.toLowerCase().trim())
-      .maybeSingle();
-    if (error) throw error;
-    return data ? toCamel(data) : null;
+    try {
+      const { data, error } = await client
+        .from(SUPABASE_TABLES.profiles)
+        .select('*')
+        .eq('email', email.toLowerCase().trim())
+        .maybeSingle();
+      if (error) throw error;
+      return data ? toCamel(data) : null;
+    } catch (err) {
+      console.error('UserService.findByEmail error:', { 
+        message: err.message, 
+        code: err.code,
+        details: err.details,
+        hint: err.hint,
+        stack: err.stack 
+      });
+      throw err;
+    }
   },
 
   async findById(id) {
     const client = getClient();
-    const { data, error } = await client
-      .from(SUPABASE_TABLES.profiles)
-      .select('*')
-      .eq('id', id)
-      .maybeSingle();
-    if (error) throw error;
-    return data ? toCamel(data) : null;
+    try {
+      const { data, error } = await client
+        .from(SUPABASE_TABLES.profiles)
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      return data ? toCamel(data) : null;
+    } catch (err) {
+      console.error('UserService.findById error:', { 
+        message: err.message, 
+        code: err.code,
+        details: err.details,
+        hint: err.hint 
+      });
+      throw err;
+    }
   },
 
   async create({ email, password, fullName, role = 'renter' }) {

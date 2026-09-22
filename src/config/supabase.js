@@ -10,6 +10,14 @@ const getSupabaseClient = (serviceRole = false) => {
     ? (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '')
     : (process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY || '');
 
+  console.log('[Supabase] Config check:', {
+    hasUrl: !!url,
+    urlLength: url.length,
+    hasKey: !!key,
+    keyLength: key.length,
+    isServiceRole: serviceRole
+  });
+
   if (!url || !key) {
     throw new Error('Supabase configuration is missing. Please set SUPABASE_URL and a valid API key.');
   }
