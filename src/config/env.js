@@ -45,8 +45,15 @@ const validateEnvironment = () => {
     required: isProduction,
     allowEmpty: false
   });
-  ensureValue('MONGODB_URI', isProduction ? undefined : 'mongodb://localhost:27017/gpu_rental_platform', {
-    required: isProduction,
+
+  // MongoDB is optional if Supabase is configured
+  const hasSupabase = Boolean(
+    process.env.SUPABASE_URL &&
+    (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_PUBLISHABLE_KEY)
+  );
+
+  ensureValue('MONGODB_URI', isProduction && !hasSupabase ? undefined : 'mongodb://localhost:27017/gpu_rental_platform', {
+    required: isProduction && !hasSupabase,
     allowEmpty: false
   });
 
