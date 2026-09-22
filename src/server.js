@@ -83,14 +83,8 @@ app.use(express.urlencoded({
   extended: true,
   limit: envConfig.urlencodedBodyLimit
 }));
-app.use(rateLimit({
-  windowMs: envConfig.rateLimitWindowMs,
-  limit: envConfig.rateLimitMaxRequests,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false
-}));
-app.use('/api/auth', authLimiter);
 
+// Health check BEFORE rate limiting
 app.get('/health', (req, res) => {
   res.status(200).json({
     success: true,
@@ -99,6 +93,14 @@ app.get('/health', (req, res) => {
     service: process.env.PLATFORM_NAME || 'Veloxora API'
   });
 });
+
+app.use(rateLimit({
+  windowMs: envConfig.rateLimitWindowMs,
+  limit: envConfig.rateLimitMaxRequests,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false
+}));
+app.use('/api/auth', authLimiter);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
