@@ -56,6 +56,42 @@ const buildFilters = (query) => {
   return filters;
 };
 
+// Helper: Pick only explicitly allowed fields (mass-assignment protection)
+const pickAllowed = (obj, allowed) => {
+  const out = {};
+  if (!obj || typeof obj !== 'object') return out;
+  for (const key of allowed) {
+    if (Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== undefined) {
+      out[key] = obj[key];
+    }
+  }
+  return out;
+};
+
+// Allowed client-supplied fields per surface (server-controlled fields like
+// id, provider_id, status, is_trusted, device_token, totals are excluded)
+const DEVICE_CREATE_FIELDS = [
+  'userId', 'name', 'hostname', 'osName', 'osVersion', 'cpuModel', 'cpuCores',
+  'ramGb', 'storageGb', 'networkInfo', 'agentVersion',
+  'gpuTemperature', 'gpuUtilization', 'vramUsedGb', 'vramTotalGb', 'powerUsageWatts'
+];
+const DEVICE_UPDATE_FIELDS = [
+  'name', 'hostname', 'osName', 'osVersion', 'networkInfo', 'agentVersion', 'autoStartEnabled'
+];
+const HEARTBEAT_FIELDS = [
+  'gpuTemperature', 'gpuUtilization', 'vramUsedGb', 'vramTotalGb', 'powerUsageWatts'
+];
+const LISTING_CREATE_FIELDS = [
+  'deviceId', 'gpuId', 'gpuName', 'gpuBrand', 'vramGb', 'cpuModel', 'cpuCores',
+  'ramGb', 'storageGb', 'osName', 'pricePerHour', 'pricePerMinute',
+  'minRentalMinutes', 'maxRentalHours', 'isPublic',
+  'locationCountry', 'locationCity', 'networkSpeedMbps',
+  'allowRemoteDesktop', 'allowFileTransfer', 'allowCustomSoftware',
+  'description', 'tags'
+];
+const LISTING_UPDATE_FIELDS = [...LISTING_CREATE_FIELDS, 'status'];
+const LISTING_PROVIDER_STATUSES = ['active', 'paused', 'maintenance'];
+
 // ============================================
 // USER / PROFILE SERVICE
 // ============================================
@@ -214,7 +250,11 @@ const DeviceService = {
 
   async create(deviceData) {
     const client = getClient();
-    const record = { ...toSnake(deviceData), id: crypto.randomUUID() };
+    // Whitelist: clients cannot set status, is_trusted, device_token, heartbeats, etc.
+    const record = {
+      ...toSnake(pickAllowed(deviceData, DEVICE_CREATE_FIELDS)),
+      id: crypto.randomUUID()
+    };
     const { data, error } = await client
       .from(SUPABASE_TABLES.devices)
       .insert([record])
@@ -226,7 +266,8 @@ const DeviceService = {
 
   async update(id, updates, userId) {
     const client = getClient();
-    const snakeUpdates = toSnake(updates);
+    const snakeUpdates = toSnake(pickAllowed(updates, DEVICE_UPDATE_FIELDS));
+    snakeUpdates.updated_at = new Date().toISOString();
     const { data, error } = await client
       .from(SUPABASE_TABLES.devices)
       .update(snakeUpdates)
@@ -241,9 +282,10 @@ const DeviceService = {
   async updateHeartbeat(id, stats) {
     const client = getClient();
     const updates = {
+      // Server-controlled fields come LAST so client stats can never override them
+      ...toSnake(pickAllowed(stats, HEARTBEAT_FIELDS)),
       last_heartbeat_at: new Date().toISOString(),
-      status: 'online',
-      ...toSnake(stats)
+      status: 'online'
     };
     const { data, error } = await client
       .from(SUPABASE_TABLES.devices)
@@ -274,7 +316,14 @@ const GpuListingService = {
     if (filters.minVram) query = query.gte('vram_gb', parseInt(filters.minVram));
     if (filters.maxPrice) query = query.lte('price_per_hour', parseFloat(filters.maxPrice));
     if (filters.search) {
-      query = query.or(`gpu_name.ilike.%${filters.search}%,gpu_brand.ilike.%${filters.search}%,cpu_model.ilike.%${filters.search}%,description.ilike.%${filters.search}%`);
+      // SECURITY: strip PostgREST filter metacharacters (,, (), ', %) and cap length
+      const safeSearch = String(filters.search)
+        .replace(/[%,()\\'"]/g, ' ')
+        .trim()
+        .slice(0, 100);
+      if (safeSearch) {
+        query = query.or(`gpu_name.ilike.%${safeSearch}%,gpu_brand.ilike.%${safeSearch}%,cpu_model.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%`);
+      }
     }
 
     // Sorting
@@ -319,8 +368,9 @@ const GpuListingService = {
 
   async create(listingData, providerId) {
     const client = getClient();
+    // Whitelist: provider cannot set own id, ratings, totals, revenue, status
     const record = {
-      ...toSnake(listingData),
+      ...toSnake(pickAllowed(listingData, LISTING_CREATE_FIELDS)),
       id: crypto.randomUUID(),
       provider_id: providerId
     };
@@ -335,7 +385,13 @@ const GpuListingService = {
 
   async update(id, updates, providerId) {
     const client = getClient();
-    const snakeUpdates = toSnake(updates);
+    const allowed = pickAllowed(updates, LISTING_UPDATE_FIELDS);
+    // Providers may only toggle availability states — never force 'rented'/'offline'
+    if (allowed.status !== undefined && !LISTING_PROVIDER_STATUSES.includes(allowed.status)) {
+      delete allowed.status;
+    }
+    const snakeUpdates = toSnake(allowed);
+    snakeUpdates.updated_at = new Date().toISOString();
     const { data, error } = await client
       .from(SUPABASE_TABLES.gpu_listings)
       .update(snakeUpdates)

@@ -208,6 +208,10 @@ CREATE TABLE IF NOT EXISTS rentals (
   actual_cost NUMERIC,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'connecting', 'active', 'paused', 'ended', 'failed', 'cancelled')),
   connection_data JSONB,
+  is_free BOOLEAN DEFAULT false,
+  session_type TEXT,
+  expires_at TIMESTAMPTZ,
+  signaling_payload JSONB,
   end_reason TEXT,
   gpu_utilization NUMERIC CHECK (gpu_utilization >= 0 AND gpu_utilization <= 100),
   vram_used NUMERIC,
@@ -242,6 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_rentals_provider ON rentals(provider_id, status);
 CREATE INDEX IF NOT EXISTS idx_rentals_renter ON rentals(renter_id, status);
 CREATE INDEX IF NOT EXISTS idx_rentals_listing ON rentals(listing_id, status);
 CREATE INDEX IF NOT EXISTS idx_rentals_start_time ON rentals(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_rentals_expires_at ON rentals(expires_at) WHERE status IN ('pending', 'active');
 
 -- ============================================
 -- 6. TRANSACTIONS TABLE

@@ -15,7 +15,8 @@ router.post('/register', validateRequest([
   body('email').isEmail().withMessage('Valid email is required'),
   body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
   body('fullName').notEmpty().withMessage('Full name is required'),
-  body('role').optional().isIn(['provider', 'renter', 'admin']).withMessage('Invalid role')
+  // SECURITY: never allow self-registration as admin — admin accounts are provisioned only by operators
+  body('role').optional().isIn(['provider', 'renter']).withMessage('Invalid role')
 ]), async (req, res) => {
   try {
     const { email, password, fullName, role = 'renter' } = req.body;
