@@ -1,6 +1,8 @@
 const PlatformCommissionService = {
-  calculateCommission(amount) {
-    const rate = parseFloat(process.env.PLATFORM_COMMISSION_RATE) || 0.15;
+  calculateCommission(amount, isFree = false) {
+    // Free rentals: 0% commission (100% to provider)
+    // Paid rentals: 0% platform commission (free platform model)
+    const rate = isFree ? 0 : 0;
     return {
       total: amount,
       commission: amount * rate,
@@ -10,7 +12,8 @@ const PlatformCommissionService = {
 
   async processRentalPayment(rental, listing) {
     const actualCost = rental.actualCost || rental.estimatedCost;
-    const commission = this.calculateCommission(actualCost);
+    const isFree = rental.isFree === true;
+    const commission = this.calculateCommission(actualCost, isFree);
     
     return {
       success: true,

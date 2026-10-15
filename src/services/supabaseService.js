@@ -5,6 +5,7 @@
 const { getSupabaseClient } = require('../config/supabase');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const { PlatformCommissionService } = require('./commissionService');
 
 const SUPABASE_TABLES = {
   profiles: 'profiles',
@@ -445,6 +446,51 @@ const RentalService = {
     return toCamel(data);
   },
 
+  async createFree(rentalData, renterId) {
+    const client = getClient();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours
+    const record = {
+      ...toSnake(rentalData),
+      id: crypto.randomUUID(),
+      renter_id: renterId,
+      start_time: now.toISOString(),
+      end_time: expiresAt.toISOString(),
+      status: 'active', // Free rentals start immediately as active
+      is_free: true,
+      session_type: 'free_ad_supported',
+      expires_at: expiresAt.toISOString()
+    };
+    const { data, error } = await client
+      .from(SUPABASE_TABLES.rentals)
+      .insert([record])
+      .select()
+      .single();
+    if (error) throw error;
+    const rental = toCamel(data);
+    
+    // Update listing status to rented for free session
+    if (rentalData.listingId) {
+      await client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .update({ status: 'rented', updated_at: new Date().toISOString() })
+        .eq('id', rentalData.listingId)
+        .eq('status', 'active');
+    }
+    
+    // Emit signaling event via Supabase realtime for provider notification
+    await client
+      .from(SUPABASE_TABLES.rentals)
+      .update({ signaling_payload: JSON.stringify({
+        type: 'free_session_started',
+        rentalId: data.id,
+        expiresAt: expiresAt.toISOString()
+      }), updated_at: new Date().toISOString() })
+      .eq('id', data.id);
+    
+    return toCamel(data);
+  },
+
   async startRental(id, renterId) {
     const client = getClient();
     // Atomic: claim rental and update listing status
@@ -498,6 +544,12 @@ const RentalService = {
     
     const listing = await GpuListingService.findById(rental.listingId);
     const actualCost = (actualDurationMinutes / 60) * (listing?.pricePerHour || 0);
+    
+    // Free platform: 0% commission, 100% to provider
+    const isFree = rental.isFree === true;
+    const commissionRate = 0; // Free platform: 0% commission
+    const platformCommission = 0;
+    const providerEarning = actualCost; // 100% to provider
 
     const { data, error } = await client
       .from(SUPABASE_TABLES.rentals)
@@ -516,6 +568,34 @@ const RentalService = {
 
     if (error) throw error;
 
+    // Update provider wallet with earnings (100% to provider, 0% platform fee)
+    if (actualCost > 0 && rental.providerId) {
+      await WalletService.adjustBalance(rental.providerId, actualCost, true);
+      
+      // Create transaction record for provider earnings
+      await TransactionService.create({
+        type: 'provider_earning',
+        status: 'completed',
+        amount: actualCost,
+        relatedId: id,
+        description: `Rental earnings (${actualDurationMinutes} min session)`
+      }, rental.providerId);
+    }
+
+    // Update renter wallet (deduct cost) if not free
+    if (actualCost > 0 && rental.renterId) {
+      await WalletService.adjustBalance(rental.renterId, -actualCost, false);
+      
+      // Create transaction record for renter charge
+      await TransactionService.create({
+        type: 'rental_charge',
+        status: 'completed',
+        amount: actualCost,
+        relatedId: id,
+        description: `Rental charge (${actualDurationMinutes} min session)`
+      }, rental.renterId);
+    }
+
     // Update listing status back to active
     await client
       .from(SUPABASE_TABLES.gpu_listings)
@@ -523,7 +603,14 @@ const RentalService = {
       .eq('id', rental.listingId)
       .eq('status', 'rented');
 
-    return toCamel(data);
+    const { data: rentalData, error: rentalError } = await client
+      .from(SUPABASE_TABLES.rentals)
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (rentalError) throw rentalError;
+    return toCamel(rentalData);
   },
 
   async cancelRental(id, userId, userRole) {

@@ -107,6 +107,69 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
+// @desc    Create FREE ad-supported rental (2 hours)
+// @route   POST /api/rentals/free
+// @access  Private/Renter
+router.post('/free', auth, async (req, res) => {
+  try {
+    if (req.user.role !== 'renter') {
+      return res.status(403).json({ message: 'Only renters can create rentals' });
+    }
+
+    const { listingId } = req.body;
+    if (!listingId) {
+      return res.status(400).json({ message: 'listingId is required' });
+    }
+
+    const listing = await GpuListingService.findById(listingId);
+    if (!listing) {
+      return res.status(404).json({ message: 'Listing not found' });
+    }
+
+    if (listing.status !== 'active') {
+      return res.status(400).json({ message: 'Listing is not available' });
+    }
+
+    // Create free rental with 2 hours (120 minutes), cost = 0
+    const freeDurationMinutes = 120; // 2 hours free
+    const rental = await RentalService.createFree({
+      listingId,
+      providerId: listing.providerId,
+      plannedDurationMinutes: freeDurationMinutes,
+      estimatedCost: 0,
+      isFree: true
+    }, req.user.id);
+
+    // Generate lightweight connection payload for signaling
+    const connectionPayload = {
+      rentalId: rental.id,
+      listingId: listing.id,
+      providerId: listing.providerId,
+      renterId: req.user.id,
+      deviceId: listing.deviceId,
+      startedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours
+      isFree: true,
+      sessionType: 'free_ad_supported'
+    };
+
+    // Emit signaling event via Supabase realtime (handled by RentalService.createFree)
+    res.status(201).json({ 
+      success: true, 
+      rental: { 
+        ...rental, 
+        connectionPayload 
+      } 
+    });
+  } catch (error) {
+    console.error('Create free rental error:', error);
+    if (isValidationError(error)) {
+      return res.status(400).json({ message: error.message });
+    }
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // @desc    Start rental
 // @route   POST /api/rentals/:id/start
 // @access  Private
