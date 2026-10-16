@@ -22,13 +22,19 @@ CREATE TABLE IF NOT EXISTS profiles (
 
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Users can read own profile" ON profiles;
+
 CREATE POLICY "Users can read own profile"
   ON profiles FOR SELECT
   USING (auth.uid() = id);
 
+DROP POLICY IF EXISTS "Users can update own profile" ON profiles;
+
 CREATE POLICY "Users can update own profile"
   ON profiles FOR UPDATE
   USING (auth.uid() = id);
+
+DROP POLICY IF EXISTS "Service role full access profiles" ON profiles;
 
 CREATE POLICY "Service role full access profiles"
   ON profiles FOR ALL
@@ -58,9 +64,13 @@ CREATE TABLE IF NOT EXISTS gpus (
 
 ALTER TABLE gpus ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Anyone can read active gpus" ON gpus;
+
 CREATE POLICY "Anyone can read active gpus"
   ON gpus FOR SELECT
   USING (is_active = true);
+
+DROP POLICY IF EXISTS "Service role full access gpus" ON gpus;
 
 CREATE POLICY "Service role full access gpus"
   ON gpus FOR ALL
@@ -101,17 +111,25 @@ CREATE TABLE IF NOT EXISTS devices (
 
 ALTER TABLE devices ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Users can read own devices" ON devices;
+
 CREATE POLICY "Users can read own devices"
   ON devices FOR SELECT
   USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Users can insert own devices" ON devices;
 
 CREATE POLICY "Users can insert own devices"
   ON devices FOR INSERT
   WITH CHECK (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can update own devices" ON devices;
+
 CREATE POLICY "Users can update own devices"
   ON devices FOR UPDATE
   USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Service role full access devices" ON devices;
 
 CREATE POLICY "Service role full access devices"
   ON devices FOR ALL
@@ -160,25 +178,37 @@ CREATE TABLE IF NOT EXISTS gpu_listings (
 
 ALTER TABLE gpu_listings ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Anyone can read active public listings" ON gpu_listings;
+
 CREATE POLICY "Anyone can read active public listings"
   ON gpu_listings FOR SELECT
   USING (status = 'active' AND is_public = true);
+
+DROP POLICY IF EXISTS "Providers can read own listings" ON gpu_listings;
 
 CREATE POLICY "Providers can read own listings"
   ON gpu_listings FOR SELECT
   USING (auth.uid() = provider_id);
 
+DROP POLICY IF EXISTS "Providers can insert own listings" ON gpu_listings;
+
 CREATE POLICY "Providers can insert own listings"
   ON gpu_listings FOR INSERT
   WITH CHECK (auth.uid() = provider_id);
+
+DROP POLICY IF EXISTS "Providers can update own listings" ON gpu_listings;
 
 CREATE POLICY "Providers can update own listings"
   ON gpu_listings FOR UPDATE
   USING (auth.uid() = provider_id);
 
+DROP POLICY IF EXISTS "Providers can delete own listings" ON gpu_listings;
+
 CREATE POLICY "Providers can delete own listings"
   ON gpu_listings FOR DELETE
   USING (auth.uid() = provider_id);
+
+DROP POLICY IF EXISTS "Service role full access listings" ON gpu_listings;
 
 CREATE POLICY "Service role full access listings"
   ON gpu_listings FOR ALL
@@ -222,21 +252,31 @@ CREATE TABLE IF NOT EXISTS rentals (
 
 ALTER TABLE rentals ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Renters can read own rentals" ON rentals;
+
 CREATE POLICY "Renters can read own rentals"
   ON rentals FOR SELECT
   USING (auth.uid() = renter_id);
+
+DROP POLICY IF EXISTS "Providers can read own rentals" ON rentals;
 
 CREATE POLICY "Providers can read own rentals"
   ON rentals FOR SELECT
   USING (auth.uid() = provider_id);
 
+DROP POLICY IF EXISTS "Renters can insert rentals" ON rentals;
+
 CREATE POLICY "Renters can insert rentals"
   ON rentals FOR INSERT
   WITH CHECK (auth.uid() = renter_id);
 
+DROP POLICY IF EXISTS "Renters/Providers can update own rentals" ON rentals;
+
 CREATE POLICY "Renters/Providers can update own rentals"
   ON rentals FOR UPDATE
   USING (auth.uid() = renter_id OR auth.uid() = provider_id);
+
+DROP POLICY IF EXISTS "Service role full access rentals" ON rentals;
 
 CREATE POLICY "Service role full access rentals"
   ON rentals FOR ALL
@@ -268,13 +308,19 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Users can read own transactions" ON transactions;
+
 CREATE POLICY "Users can read own transactions"
   ON transactions FOR SELECT
   USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can insert own transactions" ON transactions;
+
 CREATE POLICY "Users can insert own transactions"
   ON transactions FOR INSERT
   WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Service role full access transactions" ON transactions;
 
 CREATE POLICY "Service role full access transactions"
   ON transactions FOR ALL
@@ -301,9 +347,13 @@ CREATE TABLE IF NOT EXISTS wallets (
 
 ALTER TABLE wallets ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Users can read own wallet" ON wallets;
+
 CREATE POLICY "Users can read own wallet"
   ON wallets FOR SELECT
   USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "Service role full access wallets" ON wallets;
 
 CREATE POLICY "Service role full access wallets"
   ON wallets FOR ALL
@@ -372,15 +422,60 @@ GRANT SELECT ON gpus TO authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 
 -- ============================================
--- 10. SEED GPU CATALOG (Optional - run once)
+-- 10. GPU CATALOG â€” commonly rented cards (2026)
+-- Runs once; ON CONFLICT makes it safe to re-run.
 -- ============================================
--- INSERT INTO gpus (name, brand, vram_gb, cuda_cores, tensor_cores, rt_cores, tdp_watts, architecture, release_date) VALUES
--- ('RTX 4090', 'NVIDIA', 24, 16384, 512, 128, 450, 'Ada Lovelace', '2022-10-12'),
--- ('RTX 4080', 'NVIDIA', 16, 9728, 304, 76, 320, 'Ada Lovelace', '2022-11-16'),
--- ('RTX 4070 Ti', 'NVIDIA', 12, 7680, 240, 60, 285, 'Ada Lovelace', '2023-01-05'),
--- ('RTX 3090', 'NVIDIA', 24, 10496, 328, 82, 350, 'Ampere', '2020-09-24'),
--- ('RTX 3080', 'NVIDIA', 10, 8704, 272, 68, 320, 'Ampere', '2020-09-17'),
--- ('RX 7900 XTX', 'AMD', 24, NULL, NULL, NULL, 355, 'RDNA 3', '2022-12-13'),
--- ('RX 7900 XT', 'AMD', 20, NULL, NULL, NULL, 300, 'RDNA 3', '2022-12-13'),
--- ('A100 40GB', 'NVIDIA', 40, 6912, 432, NULL, 400, 'Ampere', '2020-05-14'),
--- ('H100 80GB', 'NVIDIA', 80, 16896, NULL, NULL, 700, 'Hopper', '2022-03-22');
+INSERT INTO gpus (name, brand, vram_gb, cuda_cores, tensor_cores, rt_cores, tdp_watts, architecture, release_date) VALUES
+  -- NVIDIA GeForce Blackwell (RTX 50 series)
+  ('RTX 5090',           'NVIDIA', 32, 21760, 680, 170, 575, 'Blackwell',      '2025-01-30'),
+  ('RTX 5080',           'NVIDIA', 16, 10752, 336, 84,  360, 'Blackwell',      '2025-01-30'),
+  ('RTX 5070 Ti',        'NVIDIA', 16, 8960,  280, 70,  300, 'Blackwell',      '2025-03-06'),
+  ('RTX 5070',           'NVIDIA', 12, 6144,  192, 48,  250, 'Blackwell',      '2025-03-05'),
+  ('RTX 5060 Ti',        'NVIDIA', 16, 4608,  144, 36,  180, 'Blackwell',      '2025-04-16'),
+  ('RTX 5060',           'NVIDIA', 8,  3840,  120, 30,  145, 'Blackwell',      '2025-05-19'),
+  -- NVIDIA GeForce Ada Lovelace (RTX 40 series)
+  ('RTX 4090',           'NVIDIA', 24, 16384, 512, 128, 450, 'Ada Lovelace',   '2022-10-12'),
+  ('RTX 4080 SUPER',     'NVIDIA', 16, 10240, 320, 80,  320, 'Ada Lovelace',   '2024-01-31'),
+  ('RTX 4070 Ti SUPER',  'NVIDIA', 16, 8448,  264, 66,  285, 'Ada Lovelace',   '2024-01-24'),
+  ('RTX 4070 SUPER',     'NVIDIA', 12, 7168,  224, 56,  220, 'Ada Lovelace',   '2024-01-17'),
+  ('RTX 4070',           'NVIDIA', 12, 5888,  184, 46,  200, 'Ada Lovelace',   '2023-04-13'),
+  ('RTX 4060 Ti',        'NVIDIA', 8,  4352,  136, 34,  160, 'Ada Lovelace',   '2023-05-18'),
+  ('RTX 4060',           'NVIDIA', 8,  3072,  96,  24,  115, 'Ada Lovelace',   '2023-06-29'),
+  -- NVIDIA GeForce Ampere (RTX 30 series)
+  ('RTX 3090 Ti',        'NVIDIA', 24, 10752, 336, 84,  450, 'Ampere',         '2022-03-29'),
+  ('RTX 3090',           'NVIDIA', 24, 10496, 328, 82,  350, 'Ampere',         '2020-09-24'),
+  ('RTX 3080',           'NVIDIA', 10, 8704,  272, 68,  320, 'Ampere',         '2020-09-17'),
+  ('RTX 3070',           'NVIDIA', 8,  5888,  184, 46,  220, 'Ampere',         '2020-10-29'),
+  ('RTX 3060',           'NVIDIA', 12, 3584,  112, 28,  170, 'Ampere',         '2021-02-25'),
+  -- Older NVIDIA still widely rented
+  ('RTX 2080 Ti',        'NVIDIA', 11, 4352,  NULL, NULL, 250, 'Turing',       '2018-09-27'),
+  ('GTX 1080 Ti',        'NVIDIA', 11, 3584,  NULL, NULL, 250, 'Pascal',        '2017-03-10'),
+  -- NVIDIA professional / workstation
+  ('RTX PRO 6000 Blackwell', 'NVIDIA', 96, NULL, NULL, NULL, 600, 'Blackwell',  '2025-03-18'),
+  ('RTX PRO 5000 Blackwell', 'NVIDIA', 48, NULL, NULL, NULL, NULL, 'Blackwell',  '2025-03-18'),
+  ('RTX 6000 Ada',       'NVIDIA', 48, 18176, NULL, NULL, 300, 'Ada Lovelace',  '2023-01-10'),
+  ('RTX 5000 Ada',       'NVIDIA', 32, 12800, NULL, NULL, 250, 'Ada Lovelace',  '2023-03-21'),
+  ('A6000',              'NVIDIA', 48, 10752, 336, 84,  300, 'Ampere',         '2021-04-12'),
+  -- NVIDIA data center
+  ('H200',               'NVIDIA', 141, 16896, NULL, NULL, 700, 'Hopper',      '2024-04-18'),
+  ('H100 SXM',           'NVIDIA', 80, 16896, NULL, NULL, 700, 'Hopper',       '2022-09-01'),
+  ('L40S',               'NVIDIA', 48, 18176, NULL, NULL, 350, 'Ada Lovelace', '2023-10-17'),
+  ('L4',                 'NVIDIA', 24, 7424,  NULL, NULL, 72,  'Ada Lovelace', '2023-11-06'),
+  ('A100 80GB',          'NVIDIA', 80, 6912,  432,  NULL, 400, 'Ampere',        '2020-11-23'),
+  ('A100 40GB',          'NVIDIA', 40, 6912,  432,  NULL, 400, 'Ampere',        '2020-05-14'),
+  ('V100 32GB',          'NVIDIA', 32, 5120,  640,  NULL, 300, 'Volta',         '2017-05-10'),
+  -- AMD Radeon (cuda_cores left NULL: stream processors, not CUDA)
+  ('RX 9070 XT',         'AMD', 16, NULL, NULL, NULL, 304, 'RDNA 4',           '2025-03-06'),
+  ('RX 9070',            'AMD', 16, NULL, NULL, NULL, 220, 'RDNA 4',           '2025-03-06'),
+  ('RX 7900 XTX',        'AMD', 24, NULL, NULL, NULL, 355, 'RDNA 3',           '2022-12-13'),
+  ('RX 7900 XT',         'AMD', 20, NULL, NULL, NULL, 315, 'RDNA 3',           '2022-12-13'),
+  ('RX 7800 XT',         'AMD', 16, NULL, NULL, NULL, 263, 'RDNA 3',           '2023-09-06'),
+  ('RX 7600',            'AMD', 8,  NULL, NULL, NULL, 165, 'RDNA 3',           '2023-05-25'),
+  ('RX 6800 XT',         'AMD', 16, NULL, NULL, NULL, 300, 'RDNA 2',           '2020-11-18'),
+  ('RX 6700 XT',         'AMD', 12, NULL, NULL, NULL, 230, 'RDNA 2',           '2021-03-18'),
+  ('RX 6600',            'AMD', 8,  NULL, NULL, NULL, 132, 'RDNA 2',           '2021-10-13'),
+  -- Intel Arc
+  ('Arc B580',           'Intel', 12, NULL, NULL, NULL, 190, 'Battlemage',      '2024-12-13'),
+  ('Arc A770',           'Intel', 16, NULL, NULL, NULL, 225, 'Alchemist',       '2022-10-12'),
+  ('Arc A750',           'Intel', 8,  NULL, NULL, NULL, 225, 'Alchemist',       '2022-10-12')
+ON CONFLICT (name) DO NOTHING;
