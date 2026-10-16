@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { RentalService, GpuListingService } = require('../services/supabaseService');
+const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
 const { PlatformCommissionService } = require('../services/commissionService');
 
@@ -69,7 +70,7 @@ router.post('/', auth, async (req, res) => {
       return res.status(403).json({ message: 'Only renters can create rentals' });
     }
 
-    const { listingId, plannedDurationMinutes } = req.body;
+    const { listingId, plannedDurationMinutes, billingMode } = req.body;
 
     const listing = await GpuListingService.findById(listingId);
     if (!listing) {
@@ -90,11 +91,17 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: 'Listing has an invalid price' });
     }
 
+    const normalizedBillingMode = ['time', 'tokens'].includes(billingMode)
+      ? billingMode
+      : 'time';
+
     const rental = await RentalService.create({
       listingId,
       providerId: listing.providerId,
       plannedDurationMinutes,
-      estimatedCost
+      estimatedCost,
+      estimatedCostTokens: usdToTokens(estimatedCost),
+      billingMode: normalizedBillingMode
     }, req.user.id);
 
     res.status(201).json({ success: true, rental });

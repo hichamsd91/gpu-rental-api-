@@ -479,3 +479,37 @@ INSERT INTO gpus (name, brand, vram_gb, cuda_cores, tensor_cores, rt_cores, tdp_
   ('Arc A770',           'Intel', 16, NULL, NULL, NULL, 225, 'Alchemist',       '2022-10-12'),
   ('Arc A750',           'Intel', 8,  NULL, NULL, NULL, 225, 'Alchemist',       '2022-10-12')
 ON CONFLICT (name) DO NOTHING;
+
+-- ============================================================
+-- SECTION: Multi-resource foundations (idempotent upgrades)
+-- «·√”«” «·„ ⁄œœ «·„Ê«—œ (GPU «·¬‰ + ÂÊ« › ·«Õﬁ«) + «· Êﬂ‰“ + ﬁ«∆„… «·«‰ Ÿ«—
+-- ¬„‰ ⁄·Ï ﬁ«⁄œ… ÃœÌœ… √Ê „ÊÃÊœ… ó Ì⁄«œ  ‰›Ì–Â »·« ÷——
+-- ============================================================
+
+ALTER TABLE gpu_listings ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'gpu';
+ALTER TABLE gpu_listings ADD COLUMN IF NOT EXISTS tokens_per_hour NUMERIC(12,3);
+ALTER TABLE gpu_listings ADD COLUMN IF NOT EXISTS specs JSONB NOT NULL DEFAULT '{}'::jsonb;
+UPDATE gpu_listings SET tokens_per_hour = ROUND(price_per_hour * 100, 3) WHERE tokens_per_hour IS NULL;
+CREATE INDEX IF NOT EXISTS idx_gpu_listings_resource_type ON gpu_listings(resource_type);
+
+ALTER TABLE rentals ADD COLUMN IF NOT EXISTS billing_mode TEXT NOT NULL DEFAULT 'time';
+ALTER TABLE rentals ADD COLUMN IF NOT EXISTS estimated_cost_tokens NUMERIC(12,3);
+UPDATE rentals SET estimated_cost_tokens = ROUND(estimated_cost * 100, 3) WHERE estimated_cost_tokens IS NULL AND estimated_cost IS NOT NULL;
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_kind TEXT NOT NULL DEFAULT 'gpu';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS attestation JSONB;
+
+CREATE TABLE IF NOT EXISTS waitlist (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'provider'
+    CHECK (role IN ('provider','renter','both')),
+  source TEXT DEFAULT 'phone_fleet_landing',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE waitlist ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "waitlist_public_insert" ON waitlist;
+CREATE POLICY "waitlist_public_insert" ON waitlist FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "waitlist_service_full" ON waitlist;
+CREATE POLICY "waitlist_service_full" ON waitlist FOR ALL USING (true) WITH CHECK (true);
+GRANT INSERT, SELECT ON waitlist TO anon, authenticated;

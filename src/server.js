@@ -19,6 +19,7 @@ const listingRoutes = require('./routes/listingRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const rentalRoutes = require('./routes/rentalRoutes');
 const signalingRoutes = require('./routes/signalingRoutes');
+const waitlistRoutes = require('./routes/waitlistRoutes');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -110,6 +111,7 @@ app.use('/api/listings', listingRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/rentals', rentalRoutes);
 app.use('/api/signaling', signalingRoutes);
+app.use('/api/waitlist', waitlistRoutes);
 
 app.use((req, res) => {
   res.status(404).json({

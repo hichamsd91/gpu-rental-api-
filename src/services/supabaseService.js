@@ -6,6 +6,7 @@ const { getSupabaseClient } = require('../config/supabase');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { PlatformCommissionService } = require('./commissionService');
+const { usdToTokens } = require('../utils/pricing');
 
 const SUPABASE_TABLES = {
   profiles: 'profiles',
@@ -81,13 +82,31 @@ const DEVICE_UPDATE_FIELDS = [
 const HEARTBEAT_FIELDS = [
   'gpuTemperature', 'gpuUtilization', 'vramUsedGb', 'vramTotalGb', 'powerUsageWatts'
 ];
+// True while an additive migration has not run yet: PostgREST reports the
+// missing table/column either with a raw SQL code or as a schema-cache error
+// ("Could not find the table/column ... in the schema cache", PGRST204/205).
+const isMissingSchemaObject = (error) => {
+  if (!error) return false;
+  const msg = String(error.message || '');
+  return (
+    error.code === '42703' ||
+    error.code === '42P01' ||
+    error.code === 'PGRST204' ||
+    error.code === 'PGRST205' ||
+    msg.includes('schema cache') ||
+    msg.includes('does not exist')
+  );
+};
+
 const LISTING_CREATE_FIELDS = [
   'deviceId', 'gpuId', 'gpuName', 'gpuBrand', 'vramGb', 'cpuModel', 'cpuCores',
   'ramGb', 'storageGb', 'osName', 'pricePerHour', 'pricePerMinute',
   'minRentalMinutes', 'maxRentalHours', 'isPublic',
   'locationCountry', 'locationCity', 'networkSpeedMbps',
   'allowRemoteDesktop', 'allowFileTransfer', 'allowCustomSoftware',
-  'description', 'tags'
+  'description', 'tags',
+  // Multi-resource foundations (GPU now / phones later):
+  'resourceType', 'specs'
 ];
 const LISTING_UPDATE_FIELDS = [...LISTING_CREATE_FIELDS, 'status'];
 const LISTING_PROVIDER_STATUSES = ['active', 'paused', 'maintenance'];
@@ -374,11 +393,28 @@ const GpuListingService = {
       id: crypto.randomUUID(),
       provider_id: providerId
     };
-    const { data, error } = await client
+    // Derived token price — always computed server-side from the USD price
+    // (clients can never set tokensPerHour: it is not whitelisted).
+    if (record.price_per_hour !== undefined) {
+      record.tokens_per_hour = usdToTokens(record.price_per_hour);
+    }
+    let { data, error } = await client
       .from(SUPABASE_TABLES.gpu_listings)
       .insert([record])
       .select()
       .single();
+    // Graceful fallback while the additive migration is pending
+    // (42703 = column does not exist yet).
+    if (isMissingSchemaObject(error)) {
+      delete record.resource_type;
+      delete record.specs;
+      delete record.tokens_per_hour;
+      ({ data, error } = await client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .insert([record])
+        .select()
+        .single());
+    }
     if (error) throw error;
     return toCamel(data);
   },
@@ -391,14 +427,30 @@ const GpuListingService = {
       delete allowed.status;
     }
     const snakeUpdates = toSnake(allowed);
+    // Keep the derived token price in sync whenever the USD price changes
+    if (snakeUpdates.price_per_hour !== undefined) {
+      snakeUpdates.tokens_per_hour = usdToTokens(snakeUpdates.price_per_hour);
+    }
     snakeUpdates.updated_at = new Date().toISOString();
-    const { data, error } = await client
+    let { data, error } = await client
       .from(SUPABASE_TABLES.gpu_listings)
       .update(snakeUpdates)
       .eq('id', id)
       .eq('provider_id', providerId)
       .select()
       .single();
+    if (isMissingSchemaObject(error)) {
+      delete snakeUpdates.resource_type;
+      delete snakeUpdates.specs;
+      delete snakeUpdates.tokens_per_hour;
+      ({ data, error } = await client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .update(snakeUpdates)
+        .eq('id', id)
+        .eq('provider_id', providerId)
+        .select()
+        .single());
+    }
     if (error) throw error;
     return toCamel(data);
   },
@@ -493,11 +545,21 @@ const RentalService = {
       start_time: new Date().toISOString(),
       status: 'pending'
     };
-    const { data, error } = await client
+    let { data, error } = await client
       .from(SUPABASE_TABLES.rentals)
       .insert([record])
       .select()
       .single();
+    // Graceful fallback while the additive billing migration is pending
+    if (isMissingSchemaObject(error)) {
+      delete record.billing_mode;
+      delete record.estimated_cost_tokens;
+      ({ data, error } = await client
+        .from(SUPABASE_TABLES.rentals)
+        .insert([record])
+        .select()
+        .single());
+    }
     if (error) throw error;
     return toCamel(data);
   },
@@ -814,6 +876,29 @@ const WalletService = {
   }
 };
 
+// ============================================
+// WAITLIST SERVICE (phone-fleet coming soon)
+// ============================================
+const WaitlistService = {
+  // Idempotent join: a repeated email returns { alreadyJoined: true }
+  async add(email, role) {
+    const client = getClient();
+    const record = {
+      id: crypto.randomUUID(),
+      email,
+      role,
+      source: 'phone_fleet_landing'
+    };
+    const { data, error } = await client
+      .from('waitlist')
+      .upsert([record], { onConflict: 'email', ignoreDuplicates: true })
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    return { alreadyJoined: !data };
+  }
+};
+
 module.exports = {
   UserService,
   GpuService,
@@ -822,5 +907,7 @@ module.exports = {
   RentalService,
   TransactionService,
   WalletService,
+  WaitlistService,
+  isMissingSchemaObject,
   SUPABASE_TABLES
 };
