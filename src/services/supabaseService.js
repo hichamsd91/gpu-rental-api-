@@ -481,6 +481,42 @@ const GpuListingService = {
 };
 
 // ============================================
+// LISTING RECOVERY (peer-review fix)
+// ============================================
+// Heals listings stuck in 'rented' with no active rental holding them — a
+// crash between settlement steps used to leave them that way forever (the
+// enforcer only scans rentals, never listings). Called by every sweep.
+const healStuckListings = async (limit = 100) => {
+  const client = getClient();
+  const { data: rented, error } = await client
+    .from(SUPABASE_TABLES.gpu_listings)
+    .select('id')
+    .eq('status', 'rented')
+    .limit(limit);
+  if (error) throw error;
+
+  let healed = 0;
+  for (const listing of rented || []) {
+    const { count, error: countError } = await client
+      .from(SUPABASE_TABLES.rentals)
+      .select('id', { count: 'exact', head: true })
+      .eq('listing_id', listing.id)
+      .in('status', ['active', 'connecting']);
+    if (countError) continue;
+    if (!count) {
+      const { error: updateError } = await client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .update({ status: 'active', updated_at: new Date().toISOString() })
+        .eq('id', listing.id)
+        .eq('status', 'rented');
+      if (!updateError) healed += 1;
+    }
+  }
+  if (healed > 0) console.log(`[enforcer] healed ${healed} stuck 'rented' listing(s)`);
+  return healed;
+};
+
+// ============================================
 // RENTAL SERVICE
 // ============================================
 const RentalService = {
@@ -688,7 +724,37 @@ const RentalService = {
   //     commission — and never credit money the platform did not collect)
   // Idempotent: the 'active' -> 'ended' flip is a conditional update, so a
   // manual end racing the enforcer settles exactly once.
+  //
+  // Preferred path: ONE database transaction via the settle_rental RPC
+  // (server/migrations/002_settle_rental_rpc.sql) — row-locked and exact
+  // decimal arithmetic. It closes, in a single move: the wallet race
+  // (read-balance-then-deduct), float money math, and the
+  // crash-between-steps window (peer-review fixes).
   async settleRental(id, endReason = 'manual') {
+    const client = getClient();
+    try {
+      const { error } = await client.rpc('settle_rental', {
+        p_rental_id: id,
+        p_end_reason: endReason
+      });
+      if (error) throw error;
+      return this.findById(id);
+    } catch (rpcError) {
+      const message = String(rpcError?.message || '');
+      const missing = rpcError?.code === '42883' ||
+        rpcError?.code === 'PGRST202' ||
+        (/settle_rental/i.test(message) && /does not exist/i.test(message));
+      if (!missing) throw rpcError;
+      // Migration 002 not installed yet -> best-effort JS path below.
+      return this.settleRentalJs(id, endReason);
+    }
+  },
+
+  // Best-effort JS settlement — active ONLY until the settle_rental RPC is
+  // installed. Hardened: every money step is individually guarded, the
+  // listing release ALWAYS runs, and a failed money step is recorded as a
+  // pending charge for manual review (no silent losses, no stuck listings).
+  async settleRentalJs(id, endReason = 'manual') {
     const client = getClient();
     const rental = await this.findById(id);
     if (!rental || rental.status !== 'active') return rental;
@@ -727,51 +793,77 @@ const RentalService = {
     if (flipError) throw flipError;
     if (!flip || flip.length === 0) return this.findById(id); // already settled
 
-    if (finalCost > 0) {
-      const renterWallet = await WalletService.getOrCreate(rental.renterId);
-      const available = Math.max(0, Number(renterWallet.balance) || 0);
-      const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
-      const unpaid = Math.round((finalCost - charged) * 1000) / 1000;
+    let moneyError = null;
+    try {
+      if (finalCost > 0) {
+        const renterWallet = await WalletService.getOrCreate(rental.renterId);
+        const available = Math.max(0, Number(renterWallet.balance) || 0);
+        const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
+        const unpaid = Math.round((finalCost - charged) * 1000) / 1000;
 
-      if (charged > 0) {
-        await WalletService.adjustBalance(rental.renterId, -charged, false);
-        await TransactionService.create({
-          type: 'rental_charge',
-          status: 'completed',
-          amount: charged,
-          relatedId: id,
-          description: `Rental charge (${elapsedMinutes} min session, billed ${billableMinutes} min)`
-        }, rental.renterId);
-      }
-      if (unpaid > 0) {
-        await TransactionService.create({
-          type: 'rental_charge',
-          status: 'pending',
-          amount: unpaid,
-          relatedId: id,
-          description: 'Unpaid rental remainder (top up your wallet)'
-        }, rental.renterId);
-      }
+        if (charged > 0) {
+          await WalletService.adjustBalance(rental.renterId, -charged, false);
+          await TransactionService.create({
+            type: 'rental_charge',
+            status: 'completed',
+            amount: charged,
+            relatedId: id,
+            description: `Rental charge (${elapsedMinutes} min session, billed ${billableMinutes} min)`
+          }, rental.renterId);
+        }
+        if (unpaid > 0) {
+          await TransactionService.create({
+            type: 'rental_charge',
+            status: 'pending',
+            amount: unpaid,
+            relatedId: id,
+            description: 'Unpaid rental remainder (top up your wallet)'
+          }, rental.renterId);
+        }
 
-      // 100% to the provider — of what was actually collected
-      if (charged > 0 && rental.providerId) {
-        await WalletService.adjustBalance(rental.providerId, charged, true);
-        await TransactionService.create({
-          type: 'provider_earning',
-          status: 'completed',
-          amount: charged,
-          relatedId: id,
-          description: `Rental earnings (${elapsedMinutes} min session)`
-        }, rental.providerId);
+        // 100% to the provider — of what was actually collected
+        if (charged > 0 && rental.providerId) {
+          await WalletService.adjustBalance(rental.providerId, charged, true);
+          await TransactionService.create({
+            type: 'provider_earning',
+            status: 'completed',
+            amount: charged,
+            relatedId: id,
+            description: `Rental earnings (${elapsedMinutes} min session)`
+          }, rental.providerId);
+        }
+      }
+    } catch (err) {
+      moneyError = err;
+      console.error(`[settlement] money step failed for rental ${id}:`, err.message);
+    } finally {
+      // ALWAYS release the listing — even if a money step failed (prevents
+      // the 'rented forever' trap; healStuckListings is the second net)
+      try {
+        await client
+          .from(SUPABASE_TABLES.gpu_listings)
+          .update({ status: 'active', updated_at: new Date().toISOString() })
+          .eq('id', rental.listingId)
+          .eq('status', 'rented');
+      } catch (releaseError) {
+        console.error(`[settlement] listing release failed for rental ${id}:`, releaseError.message);
       }
     }
 
-    // Release the listing
-    await client
-      .from(SUPABASE_TABLES.gpu_listings)
-      .update({ status: 'active', updated_at: endTime.toISOString() })
-      .eq('id', rental.listingId)
-      .eq('status', 'rented');
+    if (moneyError) {
+      // Leave an auditable pending charge so nothing is lost silently
+      try {
+        await TransactionService.create({
+          type: 'rental_charge',
+          status: 'pending',
+          amount: finalCost,
+          relatedId: id,
+          description: 'Settlement money-step failed — manual review'
+        }, rental.renterId);
+      } catch (logError) {
+        console.error(`[settlement] audit row failed for rental ${id}:`, logError.message);
+      }
+    }
 
     return this.findById(id);
   },
@@ -999,5 +1091,6 @@ module.exports = {
   WalletService,
   WaitlistService,
   isMissingSchemaObject,
+  healStuckListings,
   SUPABASE_TABLES
 };
