@@ -8,8 +8,10 @@ const { auth, adminAuth } = require('../middleware/auth');
 // @access  Public
 router.get('/', async (req, res) => {
   try {
-    const { brand, isActive = true } = req.query;
-    const gpus = await GpuService.findAll({ isActive: isActive === 'true' });
+    const { brand } = req.query;
+    // Default: only active GPUs. ?isActive=false returns inactive ones.
+    const isActive = req.query.isActive === undefined ? true : req.query.isActive === 'true';
+    const gpus = await GpuService.findAll({ isActive });
 
     if (brand) {
       const filtered = gpus.filter(g => g.brand === brand);
