@@ -643,11 +643,22 @@ const RentalService = {
       throw listingError;
     }
 
+    // Hard deadline for the enforcer: planned duration from the start moment
+    const plannedMinutes = Number(rental.planned_duration_minutes);
+    if (Number.isFinite(plannedMinutes) && plannedMinutes > 0) {
+      await client
+        .from(SUPABASE_TABLES.rentals)
+        .update({
+          expires_at: new Date(Date.now() + plannedMinutes * 60000).toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', id);
+    }
+
     return toCamel(rental);
   },
 
   async endRental(id, userId, userRole) {
-    const client = getClient();
     const rental = await this.findById(id);
     if (!rental) throw new Error('Rental not found');
 
@@ -656,79 +667,157 @@ const RentalService = {
 
     if (rental.status !== 'active') throw new Error('Rental is not active');
 
+    // Money settlement lives in ONE place: settleRental() — used by the
+    // manual /end route AND by the auto-expiry enforcer job.
+    return this.settleRental(id, 'manual');
+  },
+
+  // ============================================
+  // SETTLEMENT (single source of truth for money)
+  // ============================================
+  // Rules (docs/pricing-model.md):
+  //   - free (ad-supported) rentals always cost 0  [bug fix: they used to
+  //     be billed at the listing price]
+  //   - billable minutes are floored at the listing minimum and capped at
+  //     the planned duration the renter was quoted (never pay more than
+  //     the estimate)
+  //   - the renter is charged only up to the available balance (the wallet
+  //     CHECK forbids negatives); the unpaid remainder is recorded as a
+  //     PENDING transaction = honest debt until the payment gateway lands
+  //   - the provider earns 100% of what was ACTUALLY collected (0%
+  //     commission — and never credit money the platform did not collect)
+  // Idempotent: the 'active' -> 'ended' flip is a conditional update, so a
+  // manual end racing the enforcer settles exactly once.
+  async settleRental(id, endReason = 'manual') {
+    const client = getClient();
+    const rental = await this.findById(id);
+    if (!rental || rental.status !== 'active') return rental;
+
     const endTime = new Date();
     const startTime = new Date(rental.startTime);
-    const actualDurationMinutes = Math.max(1, Math.ceil((endTime - startTime) / (1000 * 60)));
-    
-    const listing = await GpuListingService.findById(rental.listingId);
-    const actualCost = (actualDurationMinutes / 60) * (listing?.pricePerHour || 0);
-    
-    // Free platform: 0% commission, 100% to provider
-    const isFree = rental.isFree === true;
-    const commissionRate = 0; // Free platform: 0% commission
-    const platformCommission = 0;
-    const providerEarning = actualCost; // 100% to provider
+    const elapsedMinutes = Math.max(1, Math.ceil((endTime - startTime) / (1000 * 60)));
 
-    const { data, error } = await client
+    const listing = await GpuListingService.findById(rental.listingId);
+
+    let finalCost = 0;
+    let billableMinutes = 0;
+    if (rental.isFree !== true) {
+      const pricePerHour = Number(listing?.pricePerHour) || 0;
+      const minMinutes = Math.max(1, Number(listing?.minRentalMinutes) || 1);
+      const planned = Math.max(1, Number(rental.plannedDurationMinutes) || minMinutes);
+      billableMinutes = Math.min(Math.max(elapsedMinutes, minMinutes), planned);
+      finalCost = Math.round((billableMinutes / 60) * pricePerHour * 1000) / 1000;
+    }
+
+    // Atomic close: only one caller wins the 'active' -> 'ended' flip
+    const { data: flip, error: flipError } = await client
       .from(SUPABASE_TABLES.rentals)
       .update({
         status: 'ended',
         end_time: endTime.toISOString(),
-        actual_duration_minutes: actualDurationMinutes,
-        actual_cost: actualCost,
-        cost_so_far: actualCost,
-        updated_at: new Date().toISOString()
+        actual_duration_minutes: elapsedMinutes,
+        actual_cost: finalCost,
+        cost_so_far: finalCost,
+        end_reason: endReason,
+        updated_at: endTime.toISOString()
       })
       .eq('id', id)
       .eq('status', 'active')
-      .select()
-      .single();
+      .select('id');
+    if (flipError) throw flipError;
+    if (!flip || flip.length === 0) return this.findById(id); // already settled
 
-    if (error) throw error;
+    if (finalCost > 0) {
+      const renterWallet = await WalletService.getOrCreate(rental.renterId);
+      const available = Math.max(0, Number(renterWallet.balance) || 0);
+      const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
+      const unpaid = Math.round((finalCost - charged) * 1000) / 1000;
 
-    // Update provider wallet with earnings (100% to provider, 0% platform fee)
-    if (actualCost > 0 && rental.providerId) {
-      await WalletService.adjustBalance(rental.providerId, actualCost, true);
-      
-      // Create transaction record for provider earnings
-      await TransactionService.create({
-        type: 'provider_earning',
-        status: 'completed',
-        amount: actualCost,
-        relatedId: id,
-        description: `Rental earnings (${actualDurationMinutes} min session)`
-      }, rental.providerId);
+      if (charged > 0) {
+        await WalletService.adjustBalance(rental.renterId, -charged, false);
+        await TransactionService.create({
+          type: 'rental_charge',
+          status: 'completed',
+          amount: charged,
+          relatedId: id,
+          description: `Rental charge (${elapsedMinutes} min session, billed ${billableMinutes} min)`
+        }, rental.renterId);
+      }
+      if (unpaid > 0) {
+        await TransactionService.create({
+          type: 'rental_charge',
+          status: 'pending',
+          amount: unpaid,
+          relatedId: id,
+          description: 'Unpaid rental remainder (top up your wallet)'
+        }, rental.renterId);
+      }
+
+      // 100% to the provider — of what was actually collected
+      if (charged > 0 && rental.providerId) {
+        await WalletService.adjustBalance(rental.providerId, charged, true);
+        await TransactionService.create({
+          type: 'provider_earning',
+          status: 'completed',
+          amount: charged,
+          relatedId: id,
+          description: `Rental earnings (${elapsedMinutes} min session)`
+        }, rental.providerId);
+      }
     }
 
-    // Update renter wallet (deduct cost) if not free
-    if (actualCost > 0 && rental.renterId) {
-      await WalletService.adjustBalance(rental.renterId, -actualCost, false);
-      
-      // Create transaction record for renter charge
-      await TransactionService.create({
-        type: 'rental_charge',
-        status: 'completed',
-        amount: actualCost,
-        relatedId: id,
-        description: `Rental charge (${actualDurationMinutes} min session)`
-      }, rental.renterId);
-    }
-
-    // Update listing status back to active
+    // Release the listing
     await client
       .from(SUPABASE_TABLES.gpu_listings)
-      .update({ status: 'active', updated_at: new Date().toISOString() })
+      .update({ status: 'active', updated_at: endTime.toISOString() })
       .eq('id', rental.listingId)
       .eq('status', 'rented');
 
-    const { data: rentalData, error: rentalError } = await client
+    return this.findById(id);
+  },
+
+  // Rentals due for auto-settlement (used by the enforcer job).
+  async findDueRentals(pendingExpiryMs = 2 * 60 * 60 * 1000) {
+    const client = getClient();
+    const { data, error } = await client
       .from(SUPABASE_TABLES.rentals)
       .select('*')
-      .eq('id', id)
-      .single();
+      .in('status', ['active', 'pending'])
+      .order('start_time', { ascending: true })
+      .limit(200);
+    if (error) throw error;
+    return (data || [])
+      .map(toCamel)
+      .filter((r) => {
+        if (r.status === 'active') {
+          if (r.expiresAt && new Date(r.expiresAt).getTime() <= Date.now()) return true;
+          const dueAt = new Date(r.startTime).getTime() +
+            (Number(r.plannedDurationMinutes) || 1) * 60000;
+          return dueAt <= Date.now();
+        }
+        if (r.status === 'pending') {
+          const created = new Date(r.createdAt || r.startTime).getTime();
+          return Date.now() - created > pendingExpiryMs;
+        }
+        return false;
+      });
+  },
 
-    if (rentalError) throw rentalError;
-    return toCamel(rentalData);
+  // Close a never-started pending rental (no money moves — nothing ran).
+  async expirePendingRental(id) {
+    const client = getClient();
+    const { data, error } = await client
+      .from(SUPABASE_TABLES.rentals)
+      .update({
+        status: 'cancelled',
+        end_reason: 'expired (never started)',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select('id');
+    if (error) throw error;
+    return Boolean(data && data.length);
   },
 
   async cancelRental(id, userId, userRole) {
@@ -791,8 +880,9 @@ const TransactionService = {
     const record = {
       ...toSnake(transactionData),
       id: crypto.randomUUID(),
-      user_id: userId,
-      status: 'pending'
+      user_id: userId
+      // status: the caller's value wins (completed/pending/...); the DB
+      // defaults to 'pending' when omitted.
     };
     const { data, error } = await client
       .from(SUPABASE_TABLES.transactions)

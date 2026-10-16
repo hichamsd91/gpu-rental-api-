@@ -20,6 +20,7 @@ const paymentRoutes = require('./routes/paymentRoutes');
 const rentalRoutes = require('./routes/rentalRoutes');
 const signalingRoutes = require('./routes/signalingRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
+const rentalEnforcer = require('./jobs/rentalEnforcer');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -181,6 +182,12 @@ const startServer = async () => {
   });
 
   console.log(`Veloxora API listening on port ${port}`);
+
+  // Auto-settlement: end expired rentals and bill them by the real rules
+  if (process.env.RENTAL_ENFORCER !== 'false') {
+    rentalEnforcer.start();
+  }
+
   return server;
 };
 
