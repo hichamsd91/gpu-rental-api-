@@ -23,6 +23,7 @@ const INTERVAL_MS = Math.max(10, Number(process.env.RENTAL_ENFORCER_INTERVAL_SEC
 const PENDING_EXPIRY_MS = 2 * 60 * 60 * 1000;
 
 let timer = null;
+let initialTimer = null;
 
 async function sweepOne(rental) {
   if (rental.status === 'active') {
@@ -62,13 +63,16 @@ function start() {
   if (timer) return;
   timer = setInterval(sweep, INTERVAL_MS);
   if (typeof timer.unref === 'function') timer.unref();
-  setTimeout(sweep, 8000); // first sweep shortly after boot
+  initialTimer = setTimeout(sweep, 8000); // first sweep shortly after boot
+  if (typeof initialTimer.unref === 'function') initialTimer.unref();
   console.log(`[enforcer] rental enforcer started (every ${INTERVAL_MS / 1000}s)`);
 }
 
 function stop() {
   if (timer) clearInterval(timer);
+  if (initialTimer) clearTimeout(initialTimer); // stop() must cancel the first sweep too
   timer = null;
+  initialTimer = null;
 }
 
 module.exports = { start, stop, sweep };

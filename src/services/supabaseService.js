@@ -5,7 +5,6 @@
 const { getSupabaseClient } = require('../config/supabase');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { PlatformCommissionService } = require('./commissionService');
 const { usdToTokens } = require('../utils/pricing');
 
 const SUPABASE_TABLES = {
@@ -623,13 +622,24 @@ const RentalService = {
     if (error) throw error;
     const rental = toCamel(data);
     
-    // Update listing status to rented for free session
+    // Claim the listing for the free session — and verify the claim took
+    // (a silent 0-row update would double-book an already rented GPU)
     if (rentalData.listingId) {
-      await client
+      const { data: claimed, error: claimError } = await client
         .from(SUPABASE_TABLES.gpu_listings)
         .update({ status: 'rented', updated_at: new Date().toISOString() })
         .eq('id', rentalData.listingId)
-        .eq('status', 'active');
+        .eq('status', 'active')
+        .select('id');
+
+      if (claimError || !claimed || claimed.length === 0) {
+        // Slot taken — cancel the just-created free rental (nothing ran)
+        await client
+          .from(SUPABASE_TABLES.rentals)
+          .update({ status: 'cancelled', end_reason: 'Listing became unavailable', updated_at: new Date().toISOString() })
+          .eq('id', data.id);
+        throw claimError || new Error('Listing is not available (already rented)');
+      }
     }
     
     // Emit signaling event via Supabase realtime for provider notification
@@ -663,20 +673,24 @@ const RentalService = {
 
     if (rentalError || !rental) throw rentalError || new Error('Rental cannot be started');
 
-    // Update listing status to rented
-    const { error: listingError } = await client
+    // Claim the listing: the 'active' -> 'rented' flip MUST affect a row.
+    // A silent 0-row update would let a second pending rental start while
+    // another session already holds the GPU (double booking).
+    const { data: claimed, error: listingError } = await client
       .from(SUPABASE_TABLES.gpu_listings)
       .update({ status: 'rented', updated_at: new Date().toISOString() })
       .eq('id', rental.listing_id)
-      .eq('status', 'active');
+      .eq('status', 'active')
+      .select('id');
 
-    if (listingError) {
-      // Rollback rental
+    if (listingError || !claimed || claimed.length === 0) {
+      // Rollback rental — the slot is taken (stale pending rentals are
+      // cancelled later by the enforcer)
       await client
         .from(SUPABASE_TABLES.rentals)
         .update({ status: 'pending', updated_at: new Date().toISOString() })
         .eq('id', id);
-      throw listingError;
+      throw listingError || new Error('Listing is not available (already rented)');
     }
 
     // Hard deadline for the enforcer: planned duration from the start moment
@@ -794,15 +808,22 @@ const RentalService = {
     if (!flip || flip.length === 0) return this.findById(id); // already settled
 
     let moneyError = null;
+    // Ledger truth-tracker: which side actually moved — so the audit trail
+    // below can never re-bill money that already left the renter's wallet
+    let renterCharged = false;
+    let chargedAmount = 0;
+    let providerCredited = false;
     try {
       if (finalCost > 0) {
         const renterWallet = await WalletService.getOrCreate(rental.renterId);
         const available = Math.max(0, Number(renterWallet.balance) || 0);
         const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
         const unpaid = Math.round((finalCost - charged) * 1000) / 1000;
+        chargedAmount = charged;
 
         if (charged > 0) {
           await WalletService.adjustBalance(rental.renterId, -charged, false);
+          renterCharged = true; // remember BEFORE any ledger row can fail
           await TransactionService.create({
             type: 'rental_charge',
             status: 'completed',
@@ -824,6 +845,7 @@ const RentalService = {
         // 100% to the provider — of what was actually collected
         if (charged > 0 && rental.providerId) {
           await WalletService.adjustBalance(rental.providerId, charged, true);
+          providerCredited = true;
           await TransactionService.create({
             type: 'provider_earning',
             status: 'completed',
@@ -851,17 +873,33 @@ const RentalService = {
     }
 
     if (moneyError) {
-      // Leave an auditable pending charge so nothing is lost silently
-      try {
-        await TransactionService.create({
-          type: 'rental_charge',
-          status: 'pending',
-          amount: finalCost,
-          relatedId: id,
-          description: 'Settlement money-step failed — manual review'
-        }, rental.renterId);
-      } catch (logError) {
-        console.error(`[settlement] audit row failed for rental ${id}:`, logError.message);
+      // Audit ONLY what truly has no ledger row — never re-bill an amount
+      // that already left the renter's wallet (peer-review fix)
+      if (finalCost > 0 && !renterCharged) {
+        try {
+          await TransactionService.create({
+            type: 'rental_charge',
+            status: 'pending',
+            amount: finalCost,
+            relatedId: id,
+            description: 'Settlement money-step failed — manual review'
+          }, rental.renterId);
+        } catch (logError) {
+          console.error(`[settlement] audit row failed for rental ${id}:`, logError.message);
+        }
+      }
+      if (renterCharged && !providerCredited && chargedAmount > 0 && rental.providerId) {
+        try {
+          await TransactionService.create({
+            type: 'provider_earning',
+            status: 'pending',
+            amount: chargedAmount,
+            relatedId: id,
+            description: 'Provider credit failed after renter charge — manual review'
+          }, rental.providerId);
+        } catch (logError) {
+          console.error(`[settlement] provider audit row failed for rental ${id}:`, logError.message);
+        }
       }
     }
 
@@ -1039,13 +1077,16 @@ const WalletService = {
   async adjustBalance(userId, amount, isEarning = false) {
     const client = getClient();
     const wallet = await this.getOrCreate(userId);
-    const newBalance = Math.max(0, wallet.balance + amount);
+    // NaN guard: a NULL ledger column must never poison the next value
+    // (Postgres NUMERIC happily stores NaN)
+    const delta = Number(amount) || 0;
+    const newBalance = Math.max(0, (Number(wallet.balance) || 0) + delta);
     const updates = {
       balance: newBalance,
       updated_at: new Date().toISOString()
     };
-    if (isEarning && amount > 0) updates.total_earnings = wallet.totalEarnings + amount;
-    if (!isEarning && amount < 0) updates.total_spent = wallet.totalSpent + Math.abs(amount);
+    if (isEarning && delta > 0) updates.total_earnings = (Number(wallet.totalEarnings) || 0) + delta;
+    if (!isEarning && delta < 0) updates.total_spent = (Number(wallet.totalSpent) || 0) + Math.abs(delta);
 
     const { data, error } = await client
       .from(SUPABASE_TABLES.wallets)

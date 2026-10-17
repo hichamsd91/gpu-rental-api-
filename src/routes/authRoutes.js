@@ -110,7 +110,8 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ message: 'Refresh token is required' });
     }
 
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    // Pin the algorithm: only HS256 (what generateTokens signs) is accepted
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, { algorithms: ['HS256'] });
     const user = await UserService.findById(decoded.id);
 
     if (!user || user.isActive === false) {

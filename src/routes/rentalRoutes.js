@@ -3,7 +3,6 @@ const router = express.Router();
 const { RentalService, GpuListingService } = require('../services/supabaseService');
 const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
-const { PlatformCommissionService } = require('../services/commissionService');
 
 const idsEqual = (left, right) => left && right && left.toString() === right.toString();
 

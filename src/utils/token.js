@@ -16,15 +16,13 @@ const generateTokens = async (userId) => {
   return { accessToken, refreshToken };
 };
 
-const sendTokenResponse = (user, statusCode, res) => {
+// The response is sent INSIDE a try/catch: a token-generation failure must
+// return a 500, never hang the request forever (peer-review fix — the old
+// version answered inside a bare .then() with no .catch()).
+const sendTokenResponse = async (user, statusCode, res) => {
   const userId = user._id || user.id;
-  generateTokens(userId).then(tokens => {
-    const options = {
-      httpOnly: true,
-      expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      sameSite: 'strict',
-      secure: process.env.NODE_ENV === 'production'
-    };
+  try {
+    const tokens = await generateTokens(userId);
 
     res.status(statusCode).json({
       success: true,
@@ -38,7 +36,10 @@ const sendTokenResponse = (user, statusCode, res) => {
         isVerified: user.isVerified ?? user.is_verified ?? false
       }
     });
-  });
+  } catch (error) {
+    console.error('Token generation error:', error);
+    res.status(500).json({ message: 'Server error during authentication' });
+  }
 };
 
 module.exports = { generateTokens, sendTokenResponse };

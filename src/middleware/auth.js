@@ -18,7 +18,8 @@ const auth = async (req, res, next) => {
       return res.status(401).json({ message: 'No token, authorization denied' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Pin the algorithm: only HS256 (what generateTokens signs) is accepted
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     const user = await findUserById(decoded.id);
 
     if (!user) {

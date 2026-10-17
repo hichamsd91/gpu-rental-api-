@@ -21,9 +21,12 @@ router.get('/wallet', auth, async (req, res) => {
 // @access  Private
 router.post('/deposit', auth, async (req, res) => {
   try {
-    const { amount, paymentMethodId } = req.body;
+    const { paymentMethodId } = req.body || {};
+    const amount = Number(req.body?.amount);
 
-    if (amount <= 0) {
+    // Until the real gateway lands this only records a PENDING row
+    // (no wallet credit) — but keep the input tight anyway
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
       return res.status(400).json({ message: 'Invalid amount' });
     }
 
@@ -62,7 +65,15 @@ router.get('/transactions', auth, async (req, res) => {
 // @access  Private
 router.post('/process', auth, async (req, res) => {
   try {
-    const { rentalId, amount } = req.body;
+    const { rentalId } = req.body || {};
+    const amount = Number(req.body?.amount);
+
+    if (!rentalId) {
+      return res.status(400).json({ message: 'rentalId is required' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000) {
+      return res.status(400).json({ message: 'Invalid amount' });
+    }
 
     const transaction = await TransactionService.create({
       type: 'rental_charge',
