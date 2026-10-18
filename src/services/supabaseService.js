@@ -6,6 +6,7 @@ const { getSupabaseClient } = require('../config/supabase');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { usdToTokens } = require('../utils/pricing');
+const { PlatformCommissionService } = require('./commissionService');
 
 const SUPABASE_TABLES = {
   profiles: 'profiles',
@@ -811,7 +812,7 @@ const RentalService = {
     // Ledger truth-tracker: which side actually moved — so the audit trail
     // below can never re-bill money that already left the renter's wallet
     let renterCharged = false;
-    let chargedAmount = 0;
+    let providerOwedAmount = 0; // 95% of what was collected (after the 5% cut)
     let providerCredited = false;
     try {
       if (finalCost > 0) {
@@ -819,7 +820,6 @@ const RentalService = {
         const available = Math.max(0, Number(renterWallet.balance) || 0);
         const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
         const unpaid = Math.round((finalCost - charged) * 1000) / 1000;
-        chargedAmount = charged;
 
         if (charged > 0) {
           await WalletService.adjustBalance(rental.renterId, -charged, false);
@@ -842,16 +842,45 @@ const RentalService = {
           }, rental.renterId);
         }
 
-        // 100% to the provider — of what was actually collected
+        // Split of what was actually collected: 5% platform operational
+        // commission + 95% to the provider (decision: commission + ads).
+        // The fee failure must NEVER block the provider's credit.
         if (charged > 0 && rental.providerId) {
-          await WalletService.adjustBalance(rental.providerId, charged, true);
+          const { commission: platformFee, providerEarning } =
+            PlatformCommissionService.calculateCommission(
+              charged,
+              rental.isFree === true
+            );
+          providerOwedAmount = providerEarning;
+
+          if (platformFee > 0) {
+            try {
+              await WalletService.getOrCreate(PlatformCommissionService.platformUserId);
+              await WalletService.adjustBalance(
+                PlatformCommissionService.platformUserId,
+                platformFee,
+                false
+              );
+              await TransactionService.create({
+                type: 'platform_fee',
+                status: 'completed',
+                amount: platformFee,
+                relatedId: id,
+                description: 'Platform operational commission (5%)'
+              }, PlatformCommissionService.platformUserId);
+            } catch (feeError) {
+              console.error(`[settlement] platform fee post failed for rental ${id}:`, feeError.message);
+            }
+          }
+
+          await WalletService.adjustBalance(rental.providerId, providerEarning, true);
           providerCredited = true;
           await TransactionService.create({
             type: 'provider_earning',
             status: 'completed',
-            amount: charged,
+            amount: providerEarning,
             relatedId: id,
-            description: `Rental earnings (${elapsedMinutes} min session)`
+            description: `Rental earnings (${elapsedMinutes} min session, after 5% platform commission)`
           }, rental.providerId);
         }
       }
@@ -888,12 +917,12 @@ const RentalService = {
           console.error(`[settlement] audit row failed for rental ${id}:`, logError.message);
         }
       }
-      if (renterCharged && !providerCredited && chargedAmount > 0 && rental.providerId) {
+      if (renterCharged && !providerCredited && providerOwedAmount > 0 && rental.providerId) {
         try {
           await TransactionService.create({
             type: 'provider_earning',
             status: 'pending',
-            amount: chargedAmount,
+            amount: providerOwedAmount,
             relatedId: id,
             description: 'Provider credit failed after renter charge — manual review'
           }, rental.providerId);
