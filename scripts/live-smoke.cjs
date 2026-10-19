@@ -12,10 +12,16 @@
  * Nothing here ever prints secret values — only status codes, messages and masked identifiers.
  *
  * NOTE on step 4 (honest signal — verified live on the real project behind .env on 2026-10-19):
- *   while migrations/004_auth_refresh_blacklist.sql has NOT been applied to Supabase yet, logout answers
- *   { success: true, revoked: false } ("Logged out") and refresh keeps working — the server's fail-soft is
- *   intentional so clients are never blocked from local sign-out. Those two checks will report FAIL until 004
- *   has run; afterwards they turn PASS (logout revoked:true / refresh -> 401 "Refresh token has been revoked").
+ *   while migrations/004_auth_refresh_blacklist.sql has NOT been applied to Supabase yet, logout still answers
+ *   { success: true, revoked: false } ("Logged out") — the WRITE side stays best-effort on purpose so clients are never
+ *   blocked from local sign-out. The READ sides fail CLOSED instead: every protected route answers 503 "temporarily
+ *   unavailable" and refresh refuses with 503 too, because an unverifiable token can never be treated as valid. A live run
+ *   against a project that lacks the table therefore fails loudly by design (that is the gate announcing itself, not a bug).
+ *   Once 004 has run: logout revoked:true / refresh -> 401 "Refresh token has been revoked", and every check turns PASS.
+ * Two deeper revocation proofs then exercise the READ path: an OLD access token whose signature and TTL are still
+ * intact must be rejected at protected routes by the middleware blacklist gate (immediate session kill — without it,
+ * a logged-out pair stays valid up to JWT_EXPIRE), while a FRESH post-rotation pair must pass through that same
+ * gate. A FAIL in those two (rather than in logout/refresh) means the revocation GATE regressed, not the migration.
  */
 
 const path = require('path');
@@ -47,7 +53,7 @@ function parseDotEnv(file) {
 async function waitForHealth() {
   for (let i = 0; i < 80; i++) { // up to ~40s for a cold boot incl. DB round-trips
     await new Promise(r => setTimeout(r, 500));
-    try { const r = await fetch(`${ROOT}/health`); if (r.status === 200) return true; } catch {}
+    try { const r = await fetch(`${ROOT}/health`); if (r.status === 200) return true; } catch { /* poll not healthy yet — keep looping */ }
   }
   return false;
 }
@@ -144,10 +150,26 @@ async function asJson(r) { try { return await r.json(); } catch { return {}; } }
     respBody = await asJson(r);
     record('refresh after logout -> 401 revoked jti (requires migration 004 applied)', r.status === 401, `HTTP ${r.status} msg="${respBody.message}"`);
 
-    // 8. revocation killed the SESSION, not the identity: re-login must still succeed
+    // 8. revocation killed the SESSION, not the identity: re-login must still succeed and hand out a FRESH pair.
     r = await fetch(`${API}/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password }) });
     respBody = await asJson(r);
     record('re-login after logout -> 200 (per-session revocation)', r.status === 200 && !!respBody.token, `HTTP ${r.status}`);
+
+    const freshAccessToken = respBody.token; // pair issued AFTER step-6 blacklisted the original pair's jti
+
+    // 9. Immediate-kill proof at protected-route level (middleware blacklist gate): the OLD access token from step 2
+    //    still verifies (signature + TTL intact) but its jti is now on the blacklist — it must be rejected NOW, on
+    //    any /api/* route. Without this gate, logout only kills new-token issuance: the old pair would authenticate
+    //    for up to JWT_EXPIRE (documented gap in docs/SECURITY.md, closed by services/revocation.js + middleware/auth.js).
+    r = await fetch(`${API}/auth/me`, { headers: { authorization: `Bearer ${accessToken}` } });
+    respBody = await asJson(r);
+    record('old access token after revocation -> 401 at protected route (middleware gate)', r.status === 401, `HTTP ${r.status} msg="${respBody.message}"`);
+
+    // 10. Positive control for #9: the SAME gate must accept the fresh post-rotation pair — proves #9's rejection is
+    //     revocation itself, not a bad-key or middleware outage.
+    r = await fetch(`${API}/auth/me`, { headers: { authorization: `Bearer ${freshAccessToken}` } });
+    respBody = await asJson(r);
+    record('fresh post-rotation pair -> 200 through the same gate (positive control)', r.status === 200 && !!respBody?.user, `HTTP ${r.status} id=${respBody?.user?.id ? 'found' : JSON.stringify(respBody).slice(0, 80)}`);
   } catch (e) {
     console.log('EXCEPTION in phase 1:', e.message);
     record('phase 1 completed without crashing', false, e.message);

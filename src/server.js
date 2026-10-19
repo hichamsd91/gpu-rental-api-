@@ -51,6 +51,11 @@ const authLimiter = rateLimit({
     success: false,
     message: 'Too many authentication attempts. Please try again later.'
   },
+  // Unit tests must never see this limiter's own 429: supertest issues every request from the same loopback IP, so once a
+  // suite has made ~10 INTENTIONALLY-failing auth assertions (wrong password, revoked jti, expired token…) within one jest
+  // worker, further expectations would silently start measuring rate-limiting instead of the route under test. Production and
+  // the live smoke (NODE_ENV != "test") are never affected by this; successful requests additionally count as zero.
+  skip: () => process.env.NODE_ENV === 'test',
   skipSuccessfulRequests: true
 });
 
