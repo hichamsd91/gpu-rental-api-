@@ -1,10 +1,15 @@
 # Dependencies
 node_modules/
 
-# Environment files
+# Environment files — every real .env file is ignored (exact name, and any
+# variant like .env.production / .env.staging). The tracked templates are the
+# *.example files, force-listed below. Never commit a real env file.
 .env
 .env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.production.example
+!.env.staging.example
 
 # Logs
 logs
