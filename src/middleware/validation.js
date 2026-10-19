@@ -28,4 +28,23 @@ const validate = (req, res, next) => {
   return res.status(400).json({ errors: errors.array() });
 };
 
-module.exports = { validate, validateRequest };
+// Shared pagination parser with strict bounds: no endpoint may accept an
+// unbounded limit or a nonsensical page (scraping/DoS hygiene). Bounds are
+// applied silently — bad input degrades to the default instead of 400-ing, so
+// callers keep one code path.
+const parsePagedQuery = (query = {}, { page: defPage = 1, limit: defLimit = 20, maxLimit = 100 } = {}) => {
+  const rawPage = Number.parseInt(String(query.page), 10);
+  const rawLimit = Number.parseInt(String(query.limit), 10);
+
+  let limit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : defLimit;
+  if (limit > maxLimit) limit = maxLimit;
+
+  let page = Number.isInteger(rawPage) && rawPage >= 1 ? rawPage : defPage;
+  // Range math in PostgREST is a signed int — keep products well inside it.
+  const maxPageForRange = Math.floor(2147483647 / limit);
+  if (page > maxPageForRange) page = maxPageForRange;
+
+  return { page, limit };
+};
+
+module.exports = { validate, validateRequest, parsePagedQuery };

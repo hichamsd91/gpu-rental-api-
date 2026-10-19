@@ -1,14 +1,21 @@
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
+// One random `jti` per login/refresh cycle, signed into BOTH tokens of the
+// pair. That is what makes server-side revocation (POST /auth/logout ->
+// auth_blacklist, see migrations/004_auth_refresh_blacklist.sql) possible:
+// without a stable id inside the token there is nothing to blacklist.
 const generateTokens = async (userId) => {
+  const claims = { id: userId, jti: crypto.randomUUID() };
+
   const accessToken = jwt.sign(
-    { id: userId },
+    claims,
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRE || '7d' }
   );
 
   const refreshToken = jwt.sign(
-    { id: userId },
+    claims,
     process.env.JWT_REFRESH_SECRET,
     { expiresIn: process.env.JWT_REFRESH_EXPIRE || '30d' }
   );
