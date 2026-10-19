@@ -28,5 +28,11 @@ CREATE TABLE IF NOT EXISTS auth_blacklist (
 
 CREATE INDEX IF NOT EXISTS idx_auth_blacklist_expires ON auth_blacklist (expires_at);
 
+-- RLS: enabled with NO policies -> reachable ONLY via the service-role key (the API server's own access path).
+-- The live project was provisioned through the Supabase SQL editor "Run and enable RLS" flow on 2026-10-19; this
+-- line keeps every future restore/re-provision byte-equivalent to what is actually deployed. No policy should ever be
+-- added here: anon/authenticated keys must NOT read or write revocation entries (dropping one row re-validates a token).
+ALTER TABLE auth_blacklist ENABLE ROW LEVEL SECURITY;
+
 -- Optional daily cleanup (safe to run any time — only already-expired rows):
 -- DELETE FROM auth_blacklist WHERE expires_at < now();
