@@ -2,6 +2,16 @@ const express = require('express');
 const router = express.Router();
 const { TransactionService, WalletService } = require('../services/supabaseService');
 const { auth } = require('../middleware/auth');
+// Payments are switchable (safe default OFF) until the real gateway is wired.
+// Reads/wallet/ledger stay live; only MONEY INTAKE returns a clean 503 while off,
+// so clients get one predictable answer instead of rows that never settle.
+const { isPaymentsEnabled } = require('../config/env');
+
+const paymentsOffHandler = (res) => res.status(503).json({
+  success: false,
+  code: 'PAYMENTS_DISABLED',
+  message: 'Payments are currently disabled on the platform.'
+});
 
 // @desc    Get wallet balance
 // @route   GET /api/payments/wallet
@@ -21,6 +31,9 @@ router.get('/wallet', auth, async (req, res) => {
 // @access  Private
 router.post('/deposit', auth, async (req, res) => {
   try {
+    // Payment intake respects the master switch — clean, predictable 503 off.
+    if (!isPaymentsEnabled()) return paymentsOffHandler(res);
+
     const { paymentMethodId } = req.body || {};
     const amount = Number(req.body?.amount);
 
@@ -65,6 +78,9 @@ router.get('/transactions', auth, async (req, res) => {
 // @access  Private
 router.post('/process', auth, async (req, res) => {
   try {
+    // Payment intake respects the master switch — clean, predictable 503 off.
+    if (!isPaymentsEnabled()) return paymentsOffHandler(res);
+
     const { rentalId } = req.body || {};
     const amount = Number(req.body?.amount);
 

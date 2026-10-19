@@ -1,0 +1,10 @@
+# Keep the production image lean and secret-free; real env files are injected
+# by the host (Render) at runtime — they must never be baked into layers.
+node_modules/
+npm-debug.log*
+.env
+.env.*
+.git/
+.github/
+*.test.js
+coverage/

@@ -30,6 +30,8 @@ const configuredOrigins = envConfig.corsOrigins;
 const corsOptions = {
   credentials: true,
   origin: (origin, callback) => {
+    // "*" can only appear here in development — validateEnvironment() makes a
+    // bare or production wildcard boot-fail before we get this far.
     if (!origin || configuredOrigins.includes('*') || configuredOrigins.includes(origin)) {
       return callback(null, true);
     }

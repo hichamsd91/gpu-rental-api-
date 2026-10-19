@@ -1,0 +1,54 @@
+# ============================================================================
+# API server tests — Node 20/22, ESLint 9 (flat config) + jest. The repo root
+# (Flutter app) has its own workflow; this covers ONLY this repository's code.
+# Monorepo subprojects live outside the inner repo and stay out by construction.
+# ============================================================================
+name: Server CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: lint + unit tests (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies (lockfile)
+        run: npm ci
+
+      # --max-warnings keeps legacy no-unused-vars noise from failing the build
+      # while still capping drift; raise 10 as warnings are cleaned up.
+      - name: Lint (errors always fail)
+        shell: bash
+        run: |
+          set +e
+          npm run lint -- --max-warnings 10 --format unix >lint-report.txt
+          rc=$?
+          [ $rc -ne 0 ] && cat lint-report.txt
+          exit $rc
+
+      - name: Upload lint report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-lint-report-node-${{ matrix.node }}
+          path: lint-report.txt
+
+      - name: Unit tests (jest — no external databases required)
+        run: npm test --ci
