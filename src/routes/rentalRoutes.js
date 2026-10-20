@@ -60,6 +60,30 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+// @desc    Get a single rental — owner-scoped (renter's own / provider's own / admin)
+// @route   GET /api/rentals/:id
+// @access  Private
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const rental = await RentalService.findById(req.params.id);
+
+    if (!rental) {
+      return res.status(404).json({ message: 'Rental not found' });
+    }
+
+    // Same authorization matrix as end/cancel — findById itself is unscoped, so the
+    // scope check MUST live here (a leaked rental id is never readable by a stranger).
+    if (!canManageRental(req, rental)) {
+      return res.status(403).json({ message: 'Not authorized to view this rental' });
+    }
+
+    res.json({ success: true, rental });
+  } catch (error) {
+    console.error('Get rental error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // @desc    Create rental
 // @route   POST /api/rentals
 // @access  Private/Renter

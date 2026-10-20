@@ -115,3 +115,48 @@ describe('rental lifecycle hardening', () => {
     expect(RentalService.startRental).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('GET /api/rentals/:id (owner-scoped read)', () => {
+  const rental = { id: 'r-1', renterId: 'u-renter', providerId: 'u-provider', status: 'active' };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    RentalService.findById.mockResolvedValue(rental);
+  });
+
+  test('returns the row to its own renter', async () => {
+    mockUser = { id: 'u-renter', role: 'renter' };
+
+    const response = await request(app).get('/api/rentals/r-1');
+
+    expect(response.status).toBe(200);
+    expect(response.body.rental.id).toBe('r-1');
+  });
+
+  test("returns the row to its own provider", async () => {
+    mockUser = { id: 'u-provider', role: 'provider' };
+
+    const response = await request(app).get('/api/rentals/r-1');
+
+    expect(response.status).toBe(200);
+  });
+
+  test('returns the row to an admin', async () => {
+    mockUser = { id: 'u-admin', role: 'admin' };
+
+    const response = await request(app).get('/api/rentals/r-1');
+
+    expect(response.status).toBe(200);
+  });
+
+  test('blocks a stranger (403) and answers a missing row with a clean 404', async () => {
+    mockUser = { id: 'u-other', role: 'renter' };
+
+    const denied = await request(app).get('/api/rentals/r-1');
+    expect(denied.status).toBe(403);
+
+    RentalService.findById.mockResolvedValue(null);
+    const missing = await request(app).get('/api/rentals/nope');
+    expect(missing.status).toBe(404);
+  });
+});
