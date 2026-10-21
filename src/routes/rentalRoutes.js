@@ -223,6 +223,15 @@ router.post('/:id/start', auth, async (req, res) => {
     res.json({ success: true, rental: startedRental });
   } catch (error) {
     console.error('Start rental error:', error);
+    // Wallet gate: no state has changed — a clear payment-required signal the
+    // client maps to its localized "top up your wallet" flow.
+    if (error && error.code === 'WALLET_INSUFFICIENT') {
+      const body = { success: false, code: 'WALLET_INSUFFICIENT', message: error.message };
+      // Numbers let the client render a localized "need X / have Y" template.
+      if (Number.isFinite(error.required)) body.required = Number(error.required);
+      if (Number.isFinite(error.available)) body.available = Number(error.available);
+      return res.status(402).json(body);
+    }
     if (isValidationError(error)) {
       return res.status(400).json({ message: error.message });
     }

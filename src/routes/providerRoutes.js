@@ -20,9 +20,11 @@ router.get('/listings', providerAuth, async (req, res) => {
 
     // Scope to the authenticated identity only. An admin who is not also a
     // provider simply gets an empty set — no cross-tenant reads (fail closed).
+    // includeAccess: this caller lists THEIR OWN rows above, so their own remote
+    // access config round-trips into the edit form (public endpoints scrub it).
     const result = await GpuListingService.findAll(
       { providerId: req.user.id },
-      { page, limit }
+      { page, limit, includeAccess: true }
     );
 
     res.json({ success: true, ...result });

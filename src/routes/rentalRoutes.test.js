@@ -114,6 +114,32 @@ describe('rental lifecycle hardening', () => {
     // startRental should be called twice (once success, once failure)
     expect(RentalService.startRental).toHaveBeenCalledTimes(2);
   });
+
+  test('maps a wallet-insufficient rejection from start to 402 with a stable code', async () => {
+    RentalService.findById.mockResolvedValue({
+      id: 'rental-1',
+      renterId: 'renter-1',
+      providerId: 'provider-1',
+      status: 'pending'
+    });
+
+    const err = new Error('Insufficient wallet balance');
+    err.code = 'WALLET_INSUFFICIENT';
+    err.required = 2.5;
+    err.available = 0;
+    RentalService.startRental.mockRejectedValue(err);
+
+    const response = await request(app).post('/api/rentals/rental-1/start').send({ plannedMinutes: 60 });
+
+    expect(response.status).toBe(402);
+    expect(response.body.success).toBe(false);
+    expect(response.body.code).toBe('WALLET_INSUFFICIENT');
+    expect(typeof response.body.message).toBe('string');
+    // Numbers pass through verbatim so the client can localize {required}/{available}
+    expect(response.body.required).toBe(2.5);
+    expect(response.body.available).toBe(0);
+    expect(RentalService.endRental).not.toHaveBeenCalled();
+  });
 });
 
 describe('GET /api/rentals/:id (owner-scoped read)', () => {

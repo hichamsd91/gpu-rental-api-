@@ -69,6 +69,73 @@ const pickAllowed = (obj, allowed) => {
   return out;
 };
 
+// SECURITY: provider-configured remote access (SSH) lives in listing.specs.access.
+// It is never part of public list/detail responses — only the owning provider's
+// self-service views and the per-rental connection_data row carry it. Mutates a
+// listing payload in place so both raw rows and embedded joins are covered.
+const stripListingAccess = (listing) => {
+  if (!listing || typeof listing !== 'object') return;
+  let specs = listing.specs;
+  if (typeof specs === 'string') {
+    try { specs = JSON.parse(specs); } catch { specs = null; }
+  }
+  if (!specs || typeof specs !== 'object' || Array.isArray(specs)) return;
+  if (!Object.prototype.hasOwnProperty.call(specs, 'access')) return;
+  const rest = { ...specs };
+  delete rest.access;
+  listing.specs = rest;
+};
+
+// Builds the per-rental access payload from provider-configured remote access
+// details (listing.specs.access = { host, port?, user? }). Written onto the
+// RENTAL row's connection_data at start — never on public listing responses.
+// Returns null when nothing usable was configured: the client then renders no
+// access card content instead of inventing one.
+const buildAccessPayload = (listing) => {
+  let specs = listing && listing.specs;
+  if (typeof specs === 'string') {
+    try { specs = JSON.parse(specs); } catch { specs = null; }
+  }
+  const access = (specs && typeof specs === 'object' && !Array.isArray(specs)) ? specs.access : null;
+  if (!access || typeof access !== 'object' || Array.isArray(access)) return null;
+
+  // SECURITY: reject values that cannot safely enter the one-liner — this blob
+  // becomes an ssh command the renter copies straight into a terminal.
+  const host = String(access.host ?? '').trim();
+  const user = String(access.user ?? '').trim();
+  if (!/^[A-Za-z0-9._:-]*$/.test(host)) return null;
+  if (user && !/^[A-Za-z0-9._\-@]*$/.test(user)) return null;
+
+  let port = parseInt(String(access.port), 10);
+  if (!Number.isFinite(port) || port < 1 || port > 65535) port = 22;
+
+  if (!host) return null; // a user-only spec would render as a malformed command
+  const target = user ? `${user}@${host}` : host;
+  return { type: 'ssh', host, port, user: user || null, command: `ssh -p ${port} ${target}` };
+};
+
+// Writes the access payload onto a rental row (connection_data). Best-effort by
+// design — missing/misconfigured access must never block the session lifecycle.
+const attachAccessPayload = async (client, rentalId, listingId) => {
+  if (!rentalId || !listingId) return;
+  try {
+    const { data: row, error } = await client
+      .from(SUPABASE_TABLES.gpu_listings)
+      .select('specs')
+      .eq('id', listingId)
+      .maybeSingle();
+    if (error) throw error;
+    const payload = buildAccessPayload(row);
+    if (!payload || !rentalId) return;
+    await client
+      .from(SUPABASE_TABLES.rentals)
+      .update({ connection_data: JSON.stringify(payload), updated_at: new Date().toISOString() })
+      .eq('id', rentalId); // no select — a failure here must not break the lifecycle
+  } catch (err) {
+    if (!isMissingSchemaObject(err)) console.warn('[rentals] access payload skipped:', err && err.message || err);
+  }
+};
+
 // Allowed client-supplied fields per surface (server-controlled fields like
 // id, provider_id, status, is_trusted, device_token, totals are excluded)
 const DEVICE_CREATE_FIELDS = [
@@ -363,8 +430,15 @@ const GpuListingService = {
     const { data, error, count } = await query;
     if (error) throw error;
 
+    // SECURITY by default: listing responses scrub the provider's remote-access
+    // config. includeAccess opts in for ONE surface only — the owning
+    // provider's self-service list (edit round-trip of their own values).
+    const listings = toCamel(data || []);
+    if (!options || !options.includeAccess) {
+      for (const listing of listings) stripListingAccess(listing);
+    }
     return {
-      listings: toCamel(data || []),
+      listings,
       pagination: {
         page,
         limit,
@@ -374,7 +448,7 @@ const GpuListingService = {
     };
   },
 
-  async findById(id) {
+  async findById(id, viewer = null) {
     const client = getClient();
     const { data, error } = await client
       .from(SUPABASE_TABLES.gpu_listings)
@@ -382,7 +456,17 @@ const GpuListingService = {
       .eq('id', id)
       .maybeSingle();
     if (error) throw error;
-    return data ? toCamel(data) : null;
+    const listing = data ? toCamel(data) : null;
+    // Owner-aware access: the owning provider may read their own remote-access
+    // config back (edit round-trip); everyone else gets it scrubbed.
+    const isOwnerViewer = !!(
+      viewer &&
+      viewer.id && data &&
+      String(viewer.id).toLowerCase() === String(data.provider_id || '').toLowerCase() &&
+      ['provider', 'admin'].includes(viewer.role)
+    );
+    if (listing && !isOwnerViewer) stripListingAccess(listing);
+    return listing;
   },
 
   async create(listingData, providerId) {
@@ -569,7 +653,11 @@ const RentalService = {
       .eq('id', id)
       .maybeSingle();
     if (error) throw error;
-    return data ? toCamel(data) : null;
+    const rental = data ? toCamel(data) : null;
+    // The full listing embed (*) includes the provider's SSH config — the
+    // per-rental connection_data row is the only API surface meant to carry it.
+    if (rental && rental.gpuListings) stripListingAccess(rental.gpuListings);
+    return rental;
   },
 
   async create(rentalData, renterId) {
@@ -621,8 +709,7 @@ const RentalService = {
       .select()
       .single();
     if (error) throw error;
-    const rental = toCamel(data);
-    
+
     // Claim the listing for the free session — and verify the claim took
     // (a silent 0-row update would double-book an already rented GPU)
     if (rentalData.listingId) {
@@ -652,12 +739,47 @@ const RentalService = {
         expiresAt: expiresAt.toISOString()
       }), updated_at: new Date().toISOString() })
       .eq('id', data.id);
-    
+
+    // Free sessions get the same per-rental access blob when configured — a
+    // rented GPU is accessed the same way whether the session costs $0.
+    await attachAccessPayload(client, data.id, rentalData.listingId);
+
     return toCamel(data);
   },
 
   async startRental(id, renterId) {
     const client = getClient();
+
+    // Balance gate (see docs/pricing-model.md, "start-time balance gate"):
+    // a paid pending rental may not start
+    // unless the renter's wallet already covers the full quote. The check runs
+    // BEFORE any state change — listing and rental stay untouched on failure,
+    // so there is nothing to roll back. Settlement remains the last line of
+    // defense (final cost capped at estimate, charge capped at balance).
+    const pendingRental = await this.findById(id);
+    if (pendingRental && pendingRental.isFree !== true) {
+      // Wallet source of truth is the rental ROW's renter — an admin who starts
+      // on behalf of a renter still triggers the same gate.
+      let requiredCost = Math.max(0, Number(pendingRental.estimatedCost) || 0);
+      if (!(requiredCost > 0)) {
+        // Estimate missing on legacy rows: re-quote from the live listing price
+        const listing = await GpuListingService.findById(pendingRental.listingId, null);
+        const pricePerHour = Number(listing?.pricePerHour) || 0;
+        const minutes = Math.max(1, Number(pendingRental.plannedDurationMinutes) || 60);
+        requiredCost = Math.round((minutes / 60) * pricePerHour * 100) / 100;
+      }
+      if (requiredCost > 0) {
+        const wallet = await WalletService.getOrCreate(pendingRental.renterId);
+        const available = Math.max(0, Number(wallet.balance) || 0);
+        // Cents-precision comparison: the quote is stored rounded to milliunits
+        if (Math.round(available * 1000) < Math.round(requiredCost * 1000)) {
+          throw Object.assign(new Error(
+            `Insufficient wallet balance to start this rental. Required $${requiredCost.toFixed(2)} but only $${available.toFixed(2)} available.`
+          ), { code: 'WALLET_INSUFFICIENT', required: requiredCost, available });
+        }
+      }
+    }
+
     // Atomic: claim rental and update listing status
     const { data: rental, error: rentalError } = await client
       .from(SUPABASE_TABLES.rentals)
@@ -706,7 +828,19 @@ const RentalService = {
         .eq('id', id);
     }
 
-    return toCamel(rental);
+    // Best-effort: publish provider-configured remote access for THIS rental.
+    // Never blocks the start (see attachAccessPayload — it swallows its own
+    // errors and degrades when a schema object is still missing). Skipped when
+    // the row already carries a payload from an earlier attempt.
+    const started = await this.findById(id);
+    if (!started) return toCamel(rental);
+    if (started.connectionData == null) {
+      await attachAccessPayload(client, id, started.listingId ?? rental.listing_id);
+      // Re-read so the response already carries the fresh connection payload.
+      const withAccess = await this.findById(id);
+      return withAccess || started;
+    }
+    return started;
   },
 
   async endRental(id, userId, userRole) {
