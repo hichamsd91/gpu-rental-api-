@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { UserService } = require('../services/supabaseService');
 const { generateTokens, sendTokenResponse } = require('../utils/token');
@@ -16,6 +17,12 @@ const { isJtiBlacklisted, revokeJti } = require('../services/revocation');
 const { auth } = require('../middleware/auth');
 const { issue: issueEmailToken, consume: consumeEmailToken, revokeAllForUser, PURPOSE } = require('../services/emailTokenService');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/mailerService');
+const { passport, googleEnabled, githubEnabled } = require('../config/passport');
+const oauth = require('../services/oauthService');
+
+// Passport needs req._passport before passport.authenticate() runs. No session
+// middleware is used: this API is stateless and every flow ends in our own JWT.
+router.use(passport.initialize());
 
 // @desc    Register user
 // @route   POST /api/auth/register
@@ -65,6 +72,11 @@ router.post('/login', validateRequest([
 
     if (user.isActive === false) {
       return res.status(403).json({ message: 'Account is deactivated' });
+    }
+
+    // The commission-ledger system account must never be a login target.
+    if (oauth.isPlatformAccount(user.id)) {
+      return res.status(403).json({ message: 'This system account cannot sign in' });
     }
 
     await UserService.updateLastLogin(user.id);
@@ -186,6 +198,10 @@ router.post('/refresh', async (req, res) => {
 
     if (!user || user.isActive === false) {
       return res.status(401).json({ message: 'Invalid refresh token' }); // no row ever / account deactivated — a genuine rejection, not an outage artifact
+    }
+
+    if (oauth.isPlatformAccount(user.id)) {
+      return res.status(401).json({ message: 'Invalid refresh token' });
     }
 
     // Rotation with revocation: issue the NEW pair first (pure crypto — never blocked by a database hiccup),
@@ -324,6 +340,106 @@ router.post('/reset-password', validateRequest([
   } catch (error) {
     console.error('Reset password error:', error.message || String(error));
     res.status(500).json({ message: 'Server error resetting password' });
+  }
+});
+
+// ============================================
+// SOCIAL SIGN-IN (Google / GitHub)
+// ============================================
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://veloxora-app.web.app';
+const OAUTH_CODE_PURPOSE = 'oauth_exchange';
+
+// The callback never puts tokens in the URL. It redirects with a signed,
+// 2-minute, single-use code that the client exchanges for a real token pair —
+// so a leaked browser history entry cannot be replayed as a session.
+const issueOAuthCode = (userId) =>
+  jwt.sign(
+    { id: userId, purpose: OAUTH_CODE_PURPOSE, jti: crypto.randomUUID() },
+    process.env.JWT_SECRET,
+    { expiresIn: '2m' }
+  );
+
+const registerProviderRoutes = (name, enabled) => {
+  router.get(`/${name}`, (req, res, next) => {
+    if (!enabled) {
+      return res.status(503).json({ message: `${name} sign-in is not configured` });
+    }
+    return passport.authenticate(name, { session: false })(req, res, next);
+  });
+
+  router.get(`/${name}/callback`, (req, res, next) => {
+    if (!enabled) {
+      return res.status(503).json({ message: `${name} sign-in is not configured` });
+    }
+    passport.authenticate(name, { session: false }, async (err, result) => {
+      const fail = (reason) => res.redirect(`${FRONTEND_URL}/#/login?error=${encodeURIComponent(reason)}`);
+
+      if (err || !result) return fail(err?.code || 'oauth_failed');
+      try {
+        const { user } = await oauth.linkOrCreate(result.provider, result.profile);
+        const code = issueOAuthCode(user.id || user._id);
+        return res.redirect(`${FRONTEND_URL}/#/oauth/callback?code=${encodeURIComponent(code)}`);
+      } catch (error) {
+        const reason = error.code || 'oauth_failed';
+        console.error(`${name} oauth callback error:`, reason, error.message || String(error));
+        return fail(reason);
+      }
+    })(req, res, next);
+  });
+};
+
+registerProviderRoutes('google', googleEnabled);
+registerProviderRoutes('github', githubEnabled);
+
+// @desc    Exchange a one-time OAuth code for a token pair
+// @route   POST /api/auth/oauth/exchange
+// @access  Public (code is signed and single-use)
+router.post('/oauth/exchange', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ message: 'Code is required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(code, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    } catch {
+      return res.status(401).json({ message: 'Invalid or expired code' });
+    }
+    if (decoded.purpose !== OAUTH_CODE_PURPOSE || !decoded.id) {
+      return res.status(401).json({ message: 'Invalid code' });
+    }
+
+    // Single-use: a code already spent (or revoked) dies here.
+    const spent = await isJtiBlacklisted(decoded.jti);
+    if (spent) return res.status(401).json({ message: 'Code already used' });
+    await revokeJti(decoded.jti, { userId: decoded.id, expSeconds: decoded.exp });
+
+    const user = await UserService.findById(decoded.id);
+    if (!user || user.isActive === false || user.is_active === false) {
+      return res.status(401).json({ message: 'Account is not available' });
+    }
+    if (oauth.isPlatformAccount(user.id)) {
+      return res.status(403).json({ message: 'This system account cannot sign in' });
+    }
+
+    const tokens = await generateTokens(user.id);
+    return res.json({
+      success: true,
+      token: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName || user.full_name,
+        role: user.role,
+        isVerified: user.isVerified ?? user.is_verified ?? true
+      }
+    });
+  } catch (error) {
+    console.error('oauth exchange error:', error.message || String(error));
+    return res.status(500).json({ message: 'Server error during sign-in' });
   }
 });
 
