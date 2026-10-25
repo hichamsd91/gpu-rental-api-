@@ -13,6 +13,9 @@ const normalizeEmail = email => String(email || '').trim().toLowerCase();
 // always established with a real signature check below; `ignoreExpiration` still requires the correct HS256
 // secret, so a forged token cannot forge jti/userId pairs into the blacklist.
 const { isJtiBlacklisted, revokeJti } = require('../services/revocation');
+const { auth } = require('../middleware/auth');
+const { issue: issueEmailToken, consume: consumeEmailToken, revokeAllForUser, PURPOSE } = require('../services/emailTokenService');
+const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/mailerService');
 
 // @desc    Register user
 // @route   POST /api/auth/register
@@ -225,6 +228,102 @@ router.post('/refresh', async (req, res) => {
     res.status(infrastructure ? 503 : 401).json({
       message: infrastructure ? 'Refresh is temporarily unavailable, retry shortly' : 'Invalid refresh token'
     });
+  }
+});
+
+// @desc    Request a fresh email-verification link
+// @route   POST /api/auth/verify-email/resend
+// @access  Private
+router.post('/verify-email/resend', auth, async (req, res) => {
+  try {
+    const user = req.user;
+    if (user.isVerified === true || user.is_verified === true) {
+      return res.json({ success: true, alreadyVerified: true });
+    }
+
+    const token = await issueEmailToken({ userId: user._id || user.id, purpose: PURPOSE.VERIFY_EMAIL });
+    await sendVerificationEmail(user.email, token);
+
+    res.json({ success: true, message: 'Verification email sent' });
+  } catch (error) {
+    console.error('Verify email resend error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error sending verification email' });
+  }
+});
+
+// @desc    Confirm an email-verification link
+// @route   GET /api/auth/verify-email?token=...
+// @access  Public
+router.get('/verify-email', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ message: 'Token is required' });
+    }
+
+    const userId = await consumeEmailToken(token, PURPOSE.VERIFY_EMAIL);
+    if (!userId) {
+      return res.status(400).json({ message: 'Verification link is invalid or expired' });
+    }
+
+    await UserService.markVerified(userId);
+    res.json({ success: true, message: 'Email verified' });
+  } catch (error) {
+    console.error('Verify email error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error during verification' });
+  }
+});
+
+// @desc    Request a password-reset link (never reveals whether the email exists)
+// @route   POST /api/auth/forgot-password
+// @access  Public
+router.post('/forgot-password', validateRequest([
+  body('email').isEmail().withMessage('Valid email is required')
+]), async (req, res) => {
+  try {
+    const normalizedEmail = normalizeEmail(req.body.email);
+    const user = await UserService.findByEmail(normalizedEmail);
+
+    // Constant response whether or not the account exists (no user enumeration).
+    if (user) {
+      const token = await issueEmailToken({ userId: user.id, purpose: PURPOSE.RESET_PASSWORD });
+      await sendPasswordResetEmail(user.email, token);
+    }
+
+    res.json({ success: true, message: 'If that email exists, a reset link has been sent' });
+  } catch (error) {
+    console.error('Forgot password error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error requesting password reset' });
+  }
+});
+
+// @desc    Reset a password with a one-time token
+// @route   POST /api/auth/reset-password
+// @access  Public
+router.post('/reset-password', validateRequest([
+  body('token').notEmpty().withMessage('Token is required'),
+  body('newPassword').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')
+]), async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    const userId = await consumeEmailToken(token, PURPOSE.RESET_PASSWORD);
+    if (!userId) {
+      return res.status(400).json({ message: 'Reset link is invalid or expired' });
+    }
+
+    const updated = await UserService.updatePassword(userId, newPassword);
+    if (!updated) {
+      return res.status(404).json({ message: 'Account not found' });
+    }
+
+    // Invalidate any other outstanding reset links for this user.
+    await revokeAllForUser(userId, PURPOSE.RESET_PASSWORD).catch(() => {});
+
+    res.json({ success: true, message: 'Password updated. Sign in with your new password.' });
+  } catch (error) {
+    console.error('Reset password error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error resetting password' });
   }
 });
 

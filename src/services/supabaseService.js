@@ -268,6 +268,33 @@ const UserService = {
 
   async updateLastLogin(id) {
     return await this.update(id, { lastLoginAt: new Date().toISOString() });
+  },
+
+  // Password updates go through bcrypt to password_hash — the generic update()
+  // maps to a non-existent `password` column, so this method exists on purpose.
+  async updatePassword(id, newPassword) {
+    const client = getClient();
+    const passwordHash = await bcrypt.hash(newPassword, parseInt(process.env.BCRYPT_ROUNDS) || 12);
+    const { data, error } = await client
+      .from(SUPABASE_TABLES.profiles)
+      .update({ password_hash: passwordHash })
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    return Boolean(data);
+  },
+
+  async markVerified(id) {
+    const client = getClient();
+    const { data, error } = await client
+      .from(SUPABASE_TABLES.profiles)
+      .update({ is_verified: true })
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    return Boolean(data);
   }
 };
 
