@@ -1,7 +1,17 @@
 const express = require('express');
 const router = express.Router();
-const { GpuListingService, GpuService } = require('../services/supabaseService');
+const { GpuListingService } = require('../services/supabaseService');
 const { auth, providerAuth } = require('../middleware/auth');
+const { isUuid } = require('../middleware/validation');
+
+// Every route below addresses a listing by uuid. Reject malformed ids here so
+// PostgREST never sees them (an invalid uuid used to surface as a 500).
+router.param('id', (req, res, next, id) => {
+  if (!isUuid(id)) {
+    return res.status(400).json({ message: 'Invalid listing id' });
+  }
+  next();
+});
 
 // @desc    Get all public listings
 // @route   GET /api/listings
@@ -42,7 +52,9 @@ router.get('/', async (req, res) => {
 // @access  Public
 router.get('/:id', async (req, res) => {
   try {
-    const listing = await GpuListingService.findById(req.params.id);
+    // Public detail must mirror the public list: only active, publicly listed
+    // rows. A hidden/paused listing is 404 here even if its uuid is known.
+    const listing = await GpuListingService.findById(req.params.id, null, { publicOnly: true });
 
     if (!listing) {
       return res.status(404).json({ message: 'Listing not found' });
@@ -91,7 +103,14 @@ router.put('/:id', auth, providerAuth, async (req, res) => {
 // @access  Private/Provider
 router.delete('/:id', auth, providerAuth, async (req, res) => {
   try {
-    await GpuListingService.delete(req.params.id, req.user.id);
+    // delete() now reports whether a row actually matched this provider. A
+    // cross-tenant / stale id must not answer "success" while deleting nothing.
+    const deleted = await GpuListingService.delete(req.params.id, req.user.id);
+
+    if (!deleted) {
+      return res.status(404).json({ message: 'Listing not found' });
+    }
+
     res.json({ success: true, message: 'Listing deleted' });
   } catch (error) {
     console.error('Delete listing error:', error);

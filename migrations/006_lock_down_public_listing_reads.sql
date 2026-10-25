@@ -1,0 +1,31 @@
+-- ============================================================================
+-- 006_lock_down_public_listing_reads.sql
+-- ----------------------------------------------------------------------------
+-- Problem: the API scrubs `specs.access` (remote SSH credentials) from every
+-- public listing response. RLS on gpu_listings only restricts ROWS, not
+-- columns: a holder of the publishable/anon key could query PostgREST directly
+-- with `select=*` and read the raw specs payload, bypassing the API scrub.
+--
+-- The Flutter client talks to the API only (it never creates a Supabase
+-- client), so direct PostgREST reads of this table are not needed. Revoke the
+-- table-level SELECT grant from PUBLIC and the anon/authenticated roles. The
+-- API keeps working because it uses the service-role key.
+--
+-- Apply manually in the Supabase Dashboard -> SQL Editor (same workflow as
+-- migrations 002-004).
+--
+-- Rollback:
+--   GRANT SELECT ON TABLE public.gpu_listings TO anon, authenticated;
+-- ============================================================================
+
+REVOKE SELECT ON TABLE public.gpu_listings FROM PUBLIC, anon, authenticated;
+
+-- The existing "active + public" RLS policy stays in place as defence in depth:
+-- if the grant is ever restored by mistake, hidden/paused rows remain unreadable.
+--
+-- Verify (the query should return no SELECT rows for anon/authenticated/PUBLIC):
+--   SELECT grantee, privilege_type
+--     FROM information_schema.role_table_grants
+--    WHERE table_schema = 'public'
+--      AND table_name = 'gpu_listings'
+--      AND grantee IN ('anon', 'authenticated', 'PUBLIC');

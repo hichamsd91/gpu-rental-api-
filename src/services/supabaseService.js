@@ -448,13 +448,20 @@ const GpuListingService = {
     };
   },
 
-  async findById(id, viewer = null) {
+  async findById(id, viewer = null, { publicOnly = false } = {}) {
     const client = getClient();
-    const { data, error } = await client
+    let query = client
       .from(SUPABASE_TABLES.gpu_listings)
       .select('*')
-      .eq('id', id)
-      .maybeSingle();
+      .eq('id', id);
+
+    // Public detail must use the same visibility rule as the public list:
+    // hidden/paused rows are not addressable just because their uuid leaked.
+    if (publicOnly) {
+      query = query.eq('is_public', true).eq('status', 'active');
+    }
+
+    const { data, error } = await query.maybeSingle();
     if (error) throw error;
     const listing = data ? toCamel(data) : null;
     // Owner-aware access: the owning provider may read their own remote-access
@@ -522,7 +529,7 @@ const GpuListingService = {
       .eq('id', id)
       .eq('provider_id', providerId)
       .select()
-      .single();
+      .maybeSingle();
     if (isMissingSchemaObject(error)) {
       delete snakeUpdates.resource_type;
       delete snakeUpdates.specs;
@@ -533,10 +540,13 @@ const GpuListingService = {
         .eq('id', id)
         .eq('provider_id', providerId)
         .select()
-        .single());
+        .maybeSingle());
     }
     if (error) throw error;
-    return toCamel(data);
+    // No row matched the (id, provider_id) pair: a different provider's id or
+    // a stale id. Return null so the route can answer 404 instead of throwing
+    // PGRST116 and leaking a 500.
+    return data ? toCamel(data) : null;
   },
 
   async updateStatus(id, status, providerId) {
@@ -554,13 +564,16 @@ const GpuListingService = {
 
   async delete(id, providerId) {
     const client = getClient();
-    const { error } = await client
+    // .select('id') makes PostgREST return the deleted row(s); an empty result
+    // means the id did not belong to this provider (or no longer exists).
+    const { data, error } = await client
       .from(SUPABASE_TABLES.gpu_listings)
       .delete()
       .eq('id', id)
-      .eq('provider_id', providerId);
+      .eq('provider_id', providerId)
+      .select('id');
     if (error) throw error;
-    return true;
+    return Array.isArray(data) && data.length > 0;
   }
 };
 

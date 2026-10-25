@@ -28,6 +28,12 @@ const validate = (req, res, next) => {
   return res.status(400).json({ errors: errors.array() });
 };
 
+// Route params that address a Postgres uuid must be validated before they reach
+// PostgREST: an invalid uuid used to bubble up as a database 22P02 and surface as
+// an opaque 500 instead of a client error.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (value) => typeof value === 'string' && UUID_RE.test(value);
+
 // Shared pagination parser with strict bounds: no endpoint may accept an
 // unbounded limit or a nonsensical page (scraping/DoS hygiene). Bounds are
 // applied silently — bad input degrades to the default instead of 400-ing, so
@@ -47,4 +53,4 @@ const parsePagedQuery = (query = {}, { page: defPage = 1, limit: defLimit = 20, 
   return { page, limit };
 };
 
-module.exports = { validate, validateRequest, parsePagedQuery };
+module.exports = { validate, validateRequest, parsePagedQuery, isUuid };
