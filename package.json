@@ -33,7 +33,7 @@
     "globals": "^17.13.0",
     "jest": "^29.7.0",
     "nodemon": "^3.0.2",
-    "supertest": "^6.3.3"
+    "supertest": "^7.3.1"
   },
   "engines": {
     "node": ">=18.0.0"
