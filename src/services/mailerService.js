@@ -22,13 +22,19 @@ const isConfigured = () =>
 let transporter = null;
 const getTransporter = () => {
   if (!transporter && isConfigured()) {
-    transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || undefined,
-      host: process.env.EMAIL_HOST || undefined,
-      port: process.env.EMAIL_PORT ? Number(process.env.EMAIL_PORT) : undefined,
-      secure: process.env.EMAIL_PORT === '465',
+    const options = {
       auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASSWORD }
-    });
+    };
+    // A named service (gmail, Yandex, ...) already carries host/port/secure
+    // defaults; passing explicit undefined values would override them.
+    if (process.env.EMAIL_SERVICE) {
+      options.service = process.env.EMAIL_SERVICE;
+    } else {
+      options.host = process.env.EMAIL_HOST;
+      options.port = process.env.EMAIL_PORT ? Number(process.env.EMAIL_PORT) : 587;
+      options.secure = String(process.env.EMAIL_PORT || '') === '465';
+    }
+    transporter = nodemailer.createTransport(options);
   }
   return transporter;
 };
