@@ -343,6 +343,15 @@ router.post('/reset-password', validateRequest([
   }
 });
 
+// @desc    Which social providers are configured on this deployment
+// @route   GET /api/auth/providers
+// @access  Public
+// The client hides buttons for providers that would only answer 503. No secret
+// is exposed — this is a boolean per provider, nothing more.
+router.get('/providers', (req, res) => {
+  res.json({ google: googleEnabled, github: githubEnabled });
+});
+
 // ============================================
 // SOCIAL SIGN-IN (Google / GitHub)
 // ============================================

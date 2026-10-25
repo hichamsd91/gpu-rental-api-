@@ -73,6 +73,15 @@ beforeEach(() => {
 
 const signCode = (claims, options = { expiresIn: '2m' }) => jwt.sign(claims, SECRET, options);
 
+describe('GET /api/auth/providers', () => {
+  test('reports booleans only — never credentials', async () => {
+    const res = await request(app).get('/api/auth/providers');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ google: false, github: false });
+    expect(Object.keys(res.body).sort()).toEqual(['github', 'google']);
+  });
+});
+
 describe('provider entry points', () => {
   test('google answers 503 when it is not configured', async () => {
     const res = await request(app).get('/api/auth/google');
