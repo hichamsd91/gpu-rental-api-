@@ -1,12 +1,14 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const sessionService = require('../services/sessionService');
 
 // One random `jti` per login/refresh cycle, signed into BOTH tokens of the
 // pair. That is what makes server-side revocation (POST /auth/logout ->
 // auth_blacklist, see migrations/004_auth_refresh_blacklist.sql) possible:
 // without a stable id inside the token there is nothing to blacklist.
 const generateTokens = async (userId) => {
-  const claims = { id: userId, jti: crypto.randomUUID() };
+  const jti = crypto.randomUUID();
+  const claims = { id: userId, jti };
 
   const accessToken = jwt.sign(
     claims,
@@ -20,16 +22,31 @@ const generateTokens = async (userId) => {
     { expiresIn: process.env.JWT_REFRESH_EXPIRE || '30d' }
   );
 
-  return { accessToken, refreshToken };
+  // The jti is returned so the caller can register this pair in `sessions`
+  // (migration 011) and later kill exactly this device.
+  return { accessToken, refreshToken, jti };
 };
 
 // The response is sent INSIDE a try/catch: a token-generation failure must
 // return a 500, never hang the request forever (peer-review fix — the old
 // version answered inside a bare .then() with no .catch()).
-const sendTokenResponse = async (user, statusCode, res, extra = {}) => {
+//
+// `options.req` (optional) enables the active-session inventory: the issued
+// pair is recorded so the user can later see and kill this device. Recording is
+// best-effort and can never fail a sign-in.
+const sendTokenResponse = async (user, statusCode, res, options = {}) => {
+  const { extra = {}, req = null } = options;
   const userId = user._id || user.id;
   try {
     const tokens = await generateTokens(userId);
+
+    if (req) {
+      try {
+        await sessionService.record({ userId, jti: tokens.jti, req });
+      } catch (error) {
+        console.error('Could not record the session:', error.message || String(error));
+      }
+    }
 
     res.status(statusCode).json({
       success: true,
@@ -43,7 +60,7 @@ const sendTokenResponse = async (user, statusCode, res, extra = {}) => {
         isVerified: user.isVerified ?? user.is_verified ?? false
       },
       // Callers may attach a small, non-secret result flag (e.g. whether the
-      // verification email actually left the building).
+      // verification email was queued).
       ...extra
     });
   } catch (error) {

@@ -45,8 +45,8 @@ beforeEach(() => jest.clearAllMocks());
 describe('POST /api/auth/register', () => {
   // The token helper is mocked in this file, so it must still terminate the
   // request — otherwise supertest waits for a response that never comes.
-  const respondWithTokens = (user, status, res, extra = {}) =>
-    res.status(status).json({ success: true, user: { id: user.id }, ...extra });
+  const respondWithTokens = (user, status, res, options = {}) =>
+    res.status(status).json({ success: true, user: { id: user.id }, ...(options.extra || {}) });
 
   test('creates the account, queues the verification link and reports it', async () => {
     sendTokenResponse.mockImplementation(respondWithTokens);
@@ -67,7 +67,7 @@ describe('POST /api/auth/register', () => {
       expect.objectContaining({ id: 'u-new' }),
       201,
       expect.anything(),
-      { verificationEmailQueued: true }
+      { extra: { verificationEmailQueued: true }, req: expect.anything() }
     );
   });
 
@@ -86,7 +86,7 @@ describe('POST /api/auth/register', () => {
       expect.objectContaining({ id: 'u-new2' }),
       201,
       expect.anything(),
-      { verificationEmailQueued: false }
+      { extra: { verificationEmailQueued: false }, req: expect.anything() }
     );
   });
 });

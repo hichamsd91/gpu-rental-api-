@@ -19,6 +19,7 @@ const { issue: issueEmailToken, consume: consumeEmailToken, revokeAllForUser, PU
 const { sendVerificationEmail, sendPasswordResetEmail, sendInBackground } = require('../services/mailerService');
 const { passport, googleEnabled, githubEnabled } = require('../config/passport');
 const oauth = require('../services/oauthService');
+const sessions = require('../services/sessionService');
 
 // Passport needs req._passport before passport.authenticate() runs. No session
 // middleware is used: this API is stateless and every flow ends in our own JWT.
@@ -60,7 +61,7 @@ router.post('/register', validateRequest([
       console.error('Register: could not queue verification email:', tokenError.message || String(tokenError));
     }
 
-    sendTokenResponse(createdUser, 201, res, { verificationEmailQueued });
+    sendTokenResponse(createdUser, 201, res, { extra: { verificationEmailQueued }, req });
   } catch (error) {
     console.error('Register error:', error);
     res.status(500).json({ message: 'Server error during registration' });
@@ -93,7 +94,7 @@ router.post('/login', validateRequest([
     }
 
     await UserService.updateLastLogin(user.id);
-    sendTokenResponse(user, 200, res);
+    sendTokenResponse(user, 200, res, { req });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ message: 'Server error during login' });
@@ -160,6 +161,9 @@ router.post('/logout', async (req, res) => {
     }
 
     const persisted = await revokeJti(decoded.jti, { userId: decoded.id, expSeconds: decoded.exp });
+
+    // Retire the inventory row too (no-op if migration 011 is not applied yet).
+    await sessions.revokeByJti({ jti: decoded.jti, userId: decoded.id });
 
     if (persisted) {
       console.log(`Logout: refresh token ${decoded.jti} for user ${decoded.id} revoked.`);
@@ -235,6 +239,12 @@ router.post('/refresh', async (req, res) => {
     } else {
       console.warn('Refresh rotation for a pre-jti token; its jti cannot be revoked individually.');
     }
+
+    // The inventory follows the rotation: the old device row is retired and the
+    // new pair takes its place (best-effort — never blocks the refresh).
+    await sessions
+      .rotate({ userId: user._id || user.id, oldJti: previousJti, newJti: tokens.jti, req })
+      .catch((error) => console.error('Session rotation failed:', error.message || String(error)));
 
     res.status(200).json({
       success: true,
@@ -368,6 +378,76 @@ router.get('/providers', (req, res) => {
 });
 
 // ============================================
+// ACTIVE SESSIONS (P1-05)
+// ============================================
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const sessionsUnavailable = (res, error) =>
+  res.status(503).json({ message: error.message, code: 'sessions_unavailable' });
+
+// @desc    The devices currently signed in with this account
+// @route   GET /api/auth/sessions
+// @access  Private
+router.get('/sessions', auth, async (req, res) => {
+  try {
+    const rows = await sessions.listActive(req.user.id || req.user._id);
+    res.json({
+      success: true,
+      sessions: rows.map((row) => ({
+        id: row.id,
+        userAgent: row.user_agent,
+        ipAddress: row.ip_address,
+        createdAt: row.created_at,
+        lastSeenAt: row.last_seen_at,
+        current: row.jti === req.authJti
+      }))
+    });
+  } catch (error) {
+    if (error instanceof sessions.SessionsUnavailable) return sessionsUnavailable(res, error);
+    console.error('List sessions error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error listing sessions' });
+  }
+});
+
+// @desc    End one session (its access AND refresh token die immediately)
+// @route   POST /api/auth/sessions/:id/revoke
+// @access  Private
+router.post('/sessions/:id/revoke', auth, async (req, res) => {
+  const { id } = req.params;
+  if (!UUID_RE.test(id)) {
+    return res.status(400).json({ message: 'Invalid session id' });
+  }
+  try {
+    const revoked = await sessions.revokeOne({ userId: req.user.id || req.user._id, sessionId: id });
+    // A session id belonging to somebody else answers exactly like a missing
+    // one, so ids cannot be probed across accounts.
+    if (!revoked) return res.status(404).json({ message: 'Session not found' });
+    res.json({ success: true, message: 'Session ended' });
+  } catch (error) {
+    if (error instanceof sessions.SessionsUnavailable) return sessionsUnavailable(res, error);
+    console.error('Revoke session error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error revoking the session' });
+  }
+});
+
+// @desc    End every other session (keep the one calling this endpoint)
+// @route   POST /api/auth/sessions/revoke-others
+// @access  Private
+router.post('/sessions/revoke-others', auth, async (req, res) => {
+  try {
+    const count = await sessions.revokeAllExcept({
+      userId: req.user.id || req.user._id,
+      keepJti: req.authJti
+    });
+    res.json({ success: true, revoked: count });
+  } catch (error) {
+    if (error instanceof sessions.SessionsUnavailable) return sessionsUnavailable(res, error);
+    console.error('Revoke other sessions error:', error.message || String(error));
+    res.status(500).json({ message: 'Server error revoking the other sessions' });
+  }
+});
+
+// ============================================
 // SOCIAL SIGN-IN (Google / GitHub)
 // ============================================
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://veloxora-app.web.app';
@@ -449,6 +529,7 @@ router.post('/oauth/exchange', async (req, res) => {
     }
 
     const tokens = await generateTokens(user.id);
+    await sessions.record({ userId: user.id, jti: tokens.jti, req });
     return res.json({
       success: true,
       token: tokens.accessToken,

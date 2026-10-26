@@ -49,6 +49,7 @@ const auth = async (req, res, next) => {
     }
 
     req.user = user;
+    req.authJti = decoded.jti;
     next();
   } catch (error) {
     // Fail CLOSED on blacklist-lookup or profile-lookup trouble: a request whose revocation
