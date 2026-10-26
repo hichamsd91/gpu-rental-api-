@@ -16,7 +16,7 @@ const normalizeEmail = email => String(email || '').trim().toLowerCase();
 const { isJtiBlacklisted, revokeJti } = require('../services/revocation');
 const { auth } = require('../middleware/auth');
 const { issue: issueEmailToken, consume: consumeEmailToken, revokeAllForUser, PURPOSE } = require('../services/emailTokenService');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/mailerService');
+const { sendVerificationEmail, sendPasswordResetEmail, sendInBackground } = require('../services/mailerService');
 const { passport, googleEnabled, githubEnabled } = require('../config/passport');
 const oauth = require('../services/oauthService');
 
@@ -47,7 +47,20 @@ router.post('/register', validateRequest([
     }
 
     const createdUser = await UserService.create({ email: normalizedEmail, password, fullName, role });
-    sendTokenResponse(createdUser, 201, res);
+
+    // Queue the verification link right after the account exists. SMTP latency
+    // (11–23s on a real network) must never delay or fail a signup, so the send
+    // is detached; the user can always ask for another link from the app.
+    let verificationEmailQueued = false;
+    try {
+      const token = await issueEmailToken({ userId: createdUser.id, purpose: PURPOSE.VERIFY_EMAIL });
+      sendInBackground(sendVerificationEmail(createdUser.email, token));
+      verificationEmailQueued = true;
+    } catch (tokenError) {
+      console.error('Register: could not queue verification email:', tokenError.message || String(tokenError));
+    }
+
+    sendTokenResponse(createdUser, 201, res, { verificationEmailQueued });
   } catch (error) {
     console.error('Register error:', error);
     res.status(500).json({ message: 'Server error during registration' });
@@ -258,9 +271,9 @@ router.post('/verify-email/resend', auth, async (req, res) => {
     }
 
     const token = await issueEmailToken({ userId: user._id || user.id, purpose: PURPOSE.VERIFY_EMAIL });
-    await sendVerificationEmail(user.email, token);
+    sendInBackground(sendVerificationEmail(user.email, token));
 
-    res.json({ success: true, message: 'Verification email sent' });
+    res.json({ success: true, message: 'Verification email queued' });
   } catch (error) {
     console.error('Verify email resend error:', error.message || String(error));
     res.status(500).json({ message: 'Server error sending verification email' });
@@ -300,10 +313,12 @@ router.post('/forgot-password', validateRequest([
     const normalizedEmail = normalizeEmail(req.body.email);
     const user = await UserService.findByEmail(normalizedEmail);
 
-    // Constant response whether or not the account exists (no user enumeration).
+    // Constant response whether or not the account exists (no user enumeration)
+    // — and constant TIMING too: the send is detached, so a known address does
+    // not answer seconds later than an unknown one.
     if (user) {
       const token = await issueEmailToken({ userId: user.id, purpose: PURPOSE.RESET_PASSWORD });
-      await sendPasswordResetEmail(user.email, token);
+      sendInBackground(sendPasswordResetEmail(user.email, token));
     }
 
     res.json({ success: true, message: 'If that email exists, a reset link has been sent' });

@@ -79,4 +79,23 @@ const sendPasswordResetEmail = (to, token) => {
   });
 };
 
-module.exports = { send, sendVerificationEmail, sendPasswordResetEmail, isConfigured };
+/**
+ * Hands the message to SMTP *without* making the HTTP request wait for it.
+ *
+ * Measured on a real network, a Gmail send takes 11–23 seconds (TLS + MSA
+ * queueing). No user-facing request may block on that: it would blow past the
+ * client's 30s timeout, and on /forgot-password it would also leak account
+ * existence through response timing (unknown address = instant answer).
+ * `send()` never rejects, so failures only ever reach the log.
+ */
+const sendInBackground = (promise) => {
+  promise.catch((error) => console.error('mailer background send failed:', error?.message || String(error)));
+};
+
+module.exports = {
+  send,
+  sendVerificationEmail,
+  sendPasswordResetEmail,
+  sendInBackground,
+  isConfigured
+};

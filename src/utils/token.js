@@ -26,7 +26,7 @@ const generateTokens = async (userId) => {
 // The response is sent INSIDE a try/catch: a token-generation failure must
 // return a 500, never hang the request forever (peer-review fix — the old
 // version answered inside a bare .then() with no .catch()).
-const sendTokenResponse = async (user, statusCode, res) => {
+const sendTokenResponse = async (user, statusCode, res, extra = {}) => {
   const userId = user._id || user.id;
   try {
     const tokens = await generateTokens(userId);
@@ -41,7 +41,10 @@ const sendTokenResponse = async (user, statusCode, res) => {
         fullName: user.fullName || user.full_name || user.name,
         role: user.role,
         isVerified: user.isVerified ?? user.is_verified ?? false
-      }
+      },
+      // Callers may attach a small, non-secret result flag (e.g. whether the
+      // verification email actually left the building).
+      ...extra
     });
   } catch (error) {
     console.error('Token generation error:', error);

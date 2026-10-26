@@ -9,7 +9,8 @@ jest.mock('../services/revocation', () => ({ isJtiBlacklisted: jest.fn(), revoke
 jest.mock('../utils/token', () => ({ generateTokens: jest.fn(), sendTokenResponse: jest.fn() }));
 jest.mock('../services/mailerService', () => ({
   sendVerificationEmail: jest.fn().mockResolvedValue({ sent: true }),
-  sendPasswordResetEmail: jest.fn().mockResolvedValue({ sent: true })
+  sendPasswordResetEmail: jest.fn().mockResolvedValue({ sent: true }),
+  sendInBackground: jest.fn((promise) => promise)
 }));
 jest.mock('../services/emailTokenService', () => ({
   issue: jest.fn(),
@@ -20,6 +21,7 @@ jest.mock('../services/emailTokenService', () => ({
 jest.mock('../services/supabaseService', () => ({
   UserService: {
     findByEmail: jest.fn(),
+    create: jest.fn(),
     markVerified: jest.fn(),
     updatePassword: jest.fn()
   }
@@ -31,6 +33,7 @@ const request = require('supertest');
 const { UserService } = require('../services/supabaseService');
 const emailTokens = require('../services/emailTokenService');
 const mailer = require('../services/mailerService');
+const { sendTokenResponse } = require('../utils/token');
 const authRoutes = require('./authRoutes');
 
 const app = express();
@@ -38,6 +41,55 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 
 beforeEach(() => jest.clearAllMocks());
+
+describe('POST /api/auth/register', () => {
+  // The token helper is mocked in this file, so it must still terminate the
+  // request — otherwise supertest waits for a response that never comes.
+  const respondWithTokens = (user, status, res, extra = {}) =>
+    res.status(status).json({ success: true, user: { id: user.id }, ...extra });
+
+  test('creates the account, queues the verification link and reports it', async () => {
+    sendTokenResponse.mockImplementation(respondWithTokens);
+    UserService.findByEmail.mockResolvedValue(null);
+    UserService.create.mockResolvedValue({ id: 'u-new', email: 'new@example.com', role: 'renter' });
+    emailTokens.issue.mockResolvedValue('raw-token');
+
+    const response = await request(app)
+      .post('/api/auth/register')
+      .send({ email: 'new@example.com', password: 'StrongPass123', fullName: 'New User' });
+
+    expect(response.status).toBeLessThan(400);
+    expect(emailTokens.issue).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'verify_email' }));
+    expect(mailer.sendVerificationEmail).toHaveBeenCalledWith('new@example.com', 'raw-token');
+    // The send is detached from the request: the response must not wait for SMTP.
+    expect(mailer.sendInBackground).toHaveBeenCalled();
+    expect(sendTokenResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'u-new' }),
+      201,
+      expect.anything(),
+      { verificationEmailQueued: true }
+    );
+  });
+
+  test('still registers when the verification email cannot be queued', async () => {
+    sendTokenResponse.mockImplementation(respondWithTokens);
+    UserService.findByEmail.mockResolvedValue(null);
+    UserService.create.mockResolvedValue({ id: 'u-new2', email: 'new2@example.com', role: 'renter' });
+    emailTokens.issue.mockRejectedValueOnce(new Error('token table down'));
+
+    const response = await request(app)
+      .post('/api/auth/register')
+      .send({ email: 'new2@example.com', password: 'StrongPass123', fullName: 'New User' });
+
+    expect(response.status).toBeLessThan(400);
+    expect(sendTokenResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'u-new2' }),
+      201,
+      expect.anything(),
+      { verificationEmailQueued: false }
+    );
+  });
+});
 
 describe('POST /api/auth/verify-email/resend', () => {
   test('issues a token and sends a verification email', async () => {
