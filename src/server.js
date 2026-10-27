@@ -19,11 +19,12 @@ const listingRoutes = require('./routes/listingRoutes');
 const catalogRoutes = require('./routes/catalogRoutes');
 const providerRoutes = require('./routes/providerRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
+const opsRoutes = require('./routes/opsRoutes');
 const rentalRoutes = require('./routes/rentalRoutes');
 const orderRoutes = require('./routes/orderRoutes');
-const signalingRoutes = require('./routes/signalingRoutes');
+const sessionRoutes = require('./routes/sessionRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
-const rentalEnforcer = require('./jobs/rentalEnforcer');
+const keepAlive = require('./jobs/keepAlive');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -89,7 +90,8 @@ app.use(cors(corsOptions));
 app.use(compression());
 app.use(cookieParser());
 app.use(express.json({
-  limit: envConfig.jsonBodyLimit
+  limit: envConfig.jsonBodyLimit,
+  verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 app.use(express.urlencoded({
   extended: true,
@@ -124,9 +126,10 @@ app.use('/api', catalogRoutes);
 app.use('/api/listings', listingRoutes);
 app.use('/api/provider', providerRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/ops', opsRoutes);
 app.use('/api/rentals', rentalRoutes);
 app.use('/api/orders', orderRoutes);
-app.use('/api/signaling', signalingRoutes);
+app.use('/api/sessions', sessionRoutes);
 app.use('/api/waitlist', waitlistRoutes);
 
 app.use((req, res) => {
@@ -202,6 +205,7 @@ const startServer = async () => {
   if (process.env.RENTAL_ENFORCER !== 'false') {
     rentalEnforcer.start();
   }
+  keepAlive.start();
 
   return server;
 };
