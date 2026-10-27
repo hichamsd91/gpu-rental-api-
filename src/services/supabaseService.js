@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { usdToTokens } = require('../utils/pricing');
 const { PlatformCommissionService } = require('./commissionService');
+const catalogService = require('./catalogService');
 
 const SUPABASE_TABLES = {
   profiles: 'profiles',
@@ -417,44 +418,57 @@ const DeviceService = {
 const GpuListingService = {
   async findAll(filters = {}, options = {}) {
     const client = getClient();
-    let query = client
-      .from(SUPABASE_TABLES.gpu_listings)
-      .select('*', { count: 'exact' });
+    // Purpose filtering happens in PostgREST (inner join) so pagination stays
+    // correct. When migration 012 is absent the join errors: we retry without
+    // it and report catalogAvailable=false instead of returning a misleading
+    // "no listings" page.
+    const purpose = filters.purpose ? String(filters.purpose).trim() : '';
+    let catalogAvailable = true;
 
-    // Apply filters
-    if (filters.status) query = query.eq('status', filters.status);
-    if (filters.isPublic !== undefined) query = query.eq('is_public', filters.isPublic);
-    if (filters.providerId) query = query.eq('provider_id', filters.providerId);
-    if (filters.gpuBrand) query = query.eq('gpu_brand', filters.gpuBrand);
-    if (filters.minVram) query = query.gte('vram_gb', parseInt(filters.minVram));
-    if (filters.maxPrice) query = query.lte('price_per_hour', parseFloat(filters.maxPrice));
-    if (filters.search) {
-      // SECURITY: strip PostgREST filter metacharacters (,, (), ', %) and cap length
-      const safeSearch = String(filters.search)
-        .replace(/[%,()\\'"]/g, ' ')
-        .trim()
-        .slice(0, 100);
-      if (safeSearch) {
-        query = query.or(`gpu_name.ilike.%${safeSearch}%,gpu_brand.ilike.%${safeSearch}%,cpu_model.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%`);
+    const runQuery = (withPurpose) => {
+      let q = client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .select(withPurpose ? '*, listing_purposes!inner(purpose_key)' : '*', { count: 'exact' });
+
+      if (withPurpose) q = q.eq('listing_purposes.purpose_key', purpose);
+      if (filters.status) q = q.eq('status', filters.status);
+      if (filters.isPublic !== undefined) q = q.eq('is_public', filters.isPublic);
+      if (filters.providerId) q = q.eq('provider_id', filters.providerId);
+      if (filters.gpuBrand) q = q.eq('gpu_brand', filters.gpuBrand);
+      if (filters.minVram) q = q.gte('vram_gb', parseInt(filters.minVram));
+      if (filters.maxPrice) q = q.lte('price_per_hour', parseFloat(filters.maxPrice));
+      if (filters.search) {
+        // SECURITY: strip PostgREST filter metacharacters (,, (), ', %) and cap length
+        const safeSearch = String(filters.search)
+          .replace(/[%,()\\'"]/g, ' ')
+          .trim()
+          .slice(0, 100);
+        if (safeSearch) {
+          q = q.or(`gpu_name.ilike.%${safeSearch}%,gpu_brand.ilike.%${safeSearch}%,cpu_model.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%`);
+        }
       }
-    }
 
-    // Sorting
-    const sortMap = {
-      price_asc: { column: 'price_per_hour', ascending: true },
-      price_desc: { column: 'price_per_hour', ascending: false },
-      rating: { column: 'average_rating', ascending: false },
-      rentals: { column: 'total_rentals', ascending: false }
+      // Sorting
+      const sortMap = {
+        price_asc: { column: 'price_per_hour', ascending: true },
+        price_desc: { column: 'price_per_hour', ascending: false },
+        rating: { column: 'average_rating', ascending: false },
+        rentals: { column: 'total_rentals', ascending: false }
+      };
+      const sort = sortMap[options.sortBy] || sortMap.price_asc;
+      q = q.order(sort.column, { ascending: sort.ascending });
+
+      // Pagination
+      const page = parseInt(options.page) || 1;
+      const limit = parseInt(options.limit) || 20;
+      return q.range((page - 1) * limit, page * limit - 1);
     };
-    const sort = sortMap[options.sortBy] || sortMap.price_asc;
-    query = query.order(sort.column, { ascending: sort.ascending });
 
-    // Pagination
-    const page = parseInt(options.page) || 1;
-    const limit = parseInt(options.limit) || 20;
-    query = query.range((page - 1) * limit, page * limit - 1);
-
-    const { data, error, count } = await query;
+    let { data, error, count } = await runQuery(Boolean(purpose));
+    if (error && purpose && isMissingSchemaObject(error)) {
+      catalogAvailable = false;
+      ({ data, error, count } = await runQuery(false));
+    }
     if (error) throw error;
 
     // SECURITY by default: listing responses scrub the provider's remote-access
@@ -464,8 +478,28 @@ const GpuListingService = {
     if (!options || !options.includeAccess) {
       for (const listing of listings) stripListingAccess(listing);
     }
+
+    // Attach purposes / software / access methods in one extra round trip.
+    if (catalogAvailable && listings.length) {
+      try {
+        const catalog = await catalogService.getCatalogForListings(listings.map((l) => l.id));
+        for (const listing of listings) {
+          const extra = catalog.get(listing.id);
+          if (!extra) continue;
+          listing.purposes = extra.purposes;
+          listing.software = extra.software;
+          listing.accessMethods = extra.accessMethods;
+        }
+      } catch (catalogError) {
+        console.error('Listings: catalog attach skipped:', catalogError.message || String(catalogError));
+      }
+    }
+
+    const page = parseInt(options.page) || 1;
+    const limit = parseInt(options.limit) || 20;
     return {
       listings,
+      catalogAvailable,
       pagination: {
         page,
         limit,
@@ -500,6 +534,19 @@ const GpuListingService = {
       ['provider', 'admin'].includes(viewer.role)
     );
     if (listing && !isOwnerViewer) stripListingAccess(listing);
+
+    // Purposes / software / access methods are public-safe (the provider's
+    // credentials stay under specs.access, which was just scrubbed above).
+    if (listing) {
+      try {
+        const catalog = await catalogService.getListingCatalog(listing.id);
+        listing.purposes = catalog.purposes;
+        listing.software = catalog.software;
+        listing.accessMethods = catalog.accessMethods;
+      } catch (catalogError) {
+        console.error('Listing detail: catalog attach skipped:', catalogError.message || String(catalogError));
+      }
+    }
     return listing;
   },
 
@@ -718,6 +765,7 @@ const RentalService = {
     if (isMissingSchemaObject(error)) {
       delete record.billing_mode;
       delete record.estimated_cost_tokens;
+      delete record.purpose;
       ({ data, error } = await client
         .from(SUPABASE_TABLES.rentals)
         .insert([record])

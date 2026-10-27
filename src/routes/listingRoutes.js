@@ -25,6 +25,7 @@ router.get('/', async (req, res) => {
       brand = '',
       minVram = '',
       maxPrice = '',
+      purpose = '',
       sortBy = 'price_asc'
     } = req.query;
 
@@ -34,7 +35,8 @@ router.get('/', async (req, res) => {
       search,
       gpuBrand: brand,
       minVram,
-      maxPrice
+      maxPrice,
+      purpose
     }, { page, limit, sortBy });
 
     res.json({

@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { RentalService, GpuListingService } = require('../services/supabaseService');
+const catalog = require('../services/catalogService');
+const featureFlags = require('../services/featureFlagService');
 const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
 
@@ -34,6 +36,45 @@ const validatePlannedDuration = (plannedDurationMinutes, listing) => {
     return `Rental duration cannot exceed ${maxMinutes} minutes`;
   }
   return null;
+};
+
+/**
+ * Picks the purpose the renter asked for (or the listing's first purpose) and
+ * the price that actually applies to it.
+ *
+ * A purpose with an explicit price is a separate product — mining must never
+ * silently bill at the base rate. When the listing offers no purposes at all
+ * (legacy rows, or migration 012 not applied) the base price is used.
+ */
+const resolvePurpose = (listing, requestedPurpose) => {
+  const purposes = Array.isArray(listing.purposes) ? listing.purposes : [];
+  const requested = requestedPurpose === undefined || requestedPurpose === null
+    ? ''
+    : String(requestedPurpose).trim();
+
+  if (!requested) {
+    const first = purposes[0];
+    if (!first) return { purpose: null, pricePerHour: Number(listing.pricePerHour), purposeRow: null };
+    return {
+      purpose: first.key,
+      pricePerHour: first.pricePerHour === null || first.pricePerHour === undefined
+        ? Number(listing.pricePerHour)
+        : Number(first.pricePerHour),
+      purposeRow: first
+    };
+  }
+
+  const match = purposes.find((p) => p.key === requested);
+  if (!match) {
+    return { error: `This listing is not offered for "${requested}"`, code: 'purpose_not_offered' };
+  }
+  return {
+    purpose: match.key,
+    pricePerHour: match.pricePerHour === null || match.pricePerHour === undefined
+      ? Number(listing.pricePerHour)
+      : Number(match.pricePerHour),
+    purposeRow: match
+  };
 };
 
 const isValidationError = error => error && (
@@ -93,7 +134,7 @@ router.post('/', auth, async (req, res) => {
       return res.status(403).json({ message: 'Only renters can create rentals' });
     }
 
-    const { listingId, plannedDurationMinutes, billingMode } = req.body;
+    const { listingId, plannedDurationMinutes, billingMode, purpose, miningAcknowledged } = req.body;
 
     const listing = await GpuListingService.findById(listingId);
     if (!listing) {
@@ -109,7 +150,54 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: durationError });
     }
 
-    const estimatedCost = (plannedDurationMinutes / 60) * listing.pricePerHour;
+    // --- Purpose + its price (P2-02 / P2-06) -----------------------------
+    const quote = resolvePurpose(listing, purpose);
+    if (quote.error) {
+      return res.status(400).json({ message: quote.error, code: quote.code });
+    }
+
+    if (quote.purpose === 'mining') {
+      // D2 is opt-in on BOTH sides: the platform flag must be on and the renter
+      // must acknowledge the declared power/disclosure before a hashing window.
+      const miningEnabled = await featureFlags.isEnabled('mining.allowed');
+      if (!miningEnabled) {
+        return res.status(403).json({
+          message: 'Mining rentals are disabled on this deployment',
+          code: 'mining_disabled'
+        });
+      }
+      if (miningAcknowledged !== true) {
+        return res.status(400).json({
+          message: 'Mining requires an explicit acknowledgement of the declared power cap and disclosure',
+          code: 'mining_ack_required'
+        });
+      }
+    }
+
+    // --- Availability + conflict prevention (P2-04) ----------------------
+    const windowStart = new Date();
+    const windowEnd = new Date(windowStart.getTime() + plannedDurationMinutes * 60000);
+    const { windows, blackouts } = await catalog.getAvailabilityRows(listingId);
+    if (!catalog.isWindowOpen(windows, blackouts, windowStart, windowEnd)) {
+      return res.status(409).json({
+        message: 'This machine is not available for the requested window',
+        code: 'listing_closed',
+        nextOpeningAt: catalog.findNextOpening(windows, blackouts, windowStart)
+      });
+    }
+    const conflicts = await catalog.findConflicts({ listingId, start: windowStart, end: windowEnd });
+    if (conflicts.length) {
+      return res.status(409).json({
+        message: 'This machine is already reserved for the requested window',
+        code: 'listing_busy',
+        busyUntil: conflicts
+          .map((row) => row.end_time || row.start_time)
+          .sort()
+          .pop() || null
+      });
+    }
+
+    const estimatedCost = (plannedDurationMinutes / 60) * quote.pricePerHour;
     if (!Number.isFinite(estimatedCost) || estimatedCost < 0) {
       return res.status(400).json({ message: 'Listing has an invalid price' });
     }
@@ -121,6 +209,7 @@ router.post('/', auth, async (req, res) => {
     const rental = await RentalService.create({
       listingId,
       providerId: listing.providerId,
+      purpose: quote.purpose,
       plannedDurationMinutes,
       estimatedCost,
       estimatedCostTokens: usdToTokens(estimatedCost),

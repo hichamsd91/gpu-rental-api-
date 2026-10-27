@@ -25,7 +25,24 @@ jest.mock('../services/supabaseService', () => ({
   },
 }));
 
+// Phase 2 guards: availability/conflict lookups default to "open and free" so
+// the pre-existing lifecycle tests keep testing exactly what they were written
+// for; the new tests below override per case.
+jest.mock('../services/catalogService', () => ({
+  getAvailabilityRows: jest.fn(async () => ({ windows: [], blackouts: [] })),
+  isWindowOpen: jest.fn(() => true),
+  findNextOpening: jest.fn(() => null),
+  findConflicts: jest.fn(async () => []),
+}));
+
+jest.mock('../services/featureFlagService', () => ({
+  isEnabled: jest.fn(async () => true),
+  enabledMap: jest.fn(async () => ({})),
+}));
+
 const { RentalService, GpuListingService } = require('../services/supabaseService');
+const catalog = require('../services/catalogService');
+const featureFlags = require('../services/featureFlagService');
 const rentalRoutes = require('./rentalRoutes');
 
 const app = express();
@@ -139,6 +156,129 @@ describe('rental lifecycle hardening', () => {
     expect(response.body.required).toBe(2.5);
     expect(response.body.available).toBe(0);
     expect(RentalService.endRental).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/rentals — purposes, availability and mining (Phase 2)', () => {
+  const baseListing = {
+    id: 'listing-1',
+    status: 'active',
+    minRentalMinutes: 30,
+    maxRentalHours: 168,
+    pricePerHour: 10,
+    providerId: 'provider-1',
+    purposes: [
+      { key: 'inference', pricePerHour: null, specs: {} },
+      { key: 'mining', pricePerHour: 3.5, specs: { powerCapWatts: 320, disclosure: 'Declared 320W continuous load, 78 dB fans, 99% uptime.' } }
+    ]
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUser = { id: 'renter-1', role: 'renter' };
+    catalog.getAvailabilityRows.mockResolvedValue({ windows: [], blackouts: [] });
+    catalog.isWindowOpen.mockReturnValue(true);
+    catalog.findConflicts.mockResolvedValue([]);
+    featureFlags.isEnabled.mockResolvedValue(true);
+    RentalService.create.mockImplementation(async (data) => ({ id: 'rental-new', ...data }));
+    GpuListingService.findById.mockResolvedValue(baseListing);
+  });
+
+  test('bills a purpose that carries its own price', async () => {
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60, purpose: 'mining', miningAcknowledged: true });
+
+    expect(response.status).toBe(201);
+    expect(RentalService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ purpose: 'mining', estimatedCost: 3.5 }),
+      'renter-1'
+    );
+  });
+
+  test('falls back to the base price for a purpose without an override', async () => {
+    await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60, purpose: 'inference' });
+
+    expect(RentalService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ purpose: 'inference', estimatedCost: 10 }),
+      'renter-1'
+    );
+  });
+
+  test('refuses a purpose the listing does not offer', async () => {
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60, purpose: 'rendering' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('purpose_not_offered');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('refuses mining without the renter acknowledgement', async () => {
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60, purpose: 'mining' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('mining_ack_required');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('refuses mining when the platform flag is off (D2 kill switch)', async () => {
+    featureFlags.isEnabled.mockResolvedValue(false);
+
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60, purpose: 'mining', miningAcknowledged: true });
+
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe('mining_disabled');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('answers 409 when the requested window is outside the provider hours', async () => {
+    catalog.isWindowOpen.mockReturnValue(false);
+    catalog.findNextOpening.mockReturnValue('2026-10-28T08:00:00.000Z');
+
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('listing_closed');
+    expect(response.body.nextOpeningAt).toBe('2026-10-28T08:00:00.000Z');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('answers 409 when another rental already holds the window', async () => {
+    catalog.findConflicts.mockResolvedValue([
+      { id: 'r-other', start_time: new Date().toISOString(), end_time: new Date(Date.now() + 3600000).toISOString() }
+    ]);
+
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.code).toBe('listing_busy');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('legacy listing without purposes still books at the base price', async () => {
+    GpuListingService.findById.mockResolvedValue({ ...baseListing, purposes: [] });
+
+    const response = await request(app)
+      .post('/api/rentals')
+      .send({ listingId: 'listing-1', plannedDurationMinutes: 60 });
+
+    expect(response.status).toBe(201);
+    expect(RentalService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ purpose: null, estimatedCost: 10 }),
+      'renter-1'
+    );
   });
 });
 

@@ -16,6 +16,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const deviceRoutes = require('./routes/deviceRoutes');
 const gpuRoutes = require('./routes/gpuRoutes');
 const listingRoutes = require('./routes/listingRoutes');
+const catalogRoutes = require('./routes/catalogRoutes');
 const providerRoutes = require('./routes/providerRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const rentalRoutes = require('./routes/rentalRoutes');
@@ -116,6 +117,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/devices', deviceRoutes);
 app.use('/api/gpus', gpuRoutes);
+// Catalog routes must precede the listing router: they own /listings/:id/availability
+// and the provider-side /listings/:id/{purposes,software,access-methods,availability}.
+app.use('/api', catalogRoutes);
 app.use('/api/listings', listingRoutes);
 app.use('/api/provider', providerRoutes);
 app.use('/api/payments', paymentRoutes);
