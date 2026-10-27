@@ -20,6 +20,7 @@ const catalogRoutes = require('./routes/catalogRoutes');
 const providerRoutes = require('./routes/providerRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const rentalRoutes = require('./routes/rentalRoutes');
+const orderRoutes = require('./routes/orderRoutes');
 const signalingRoutes = require('./routes/signalingRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
 const rentalEnforcer = require('./jobs/rentalEnforcer');
@@ -124,6 +125,7 @@ app.use('/api/listings', listingRoutes);
 app.use('/api/provider', providerRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/rentals', rentalRoutes);
+app.use('/api/orders', orderRoutes);
 app.use('/api/signaling', signalingRoutes);
 app.use('/api/waitlist', waitlistRoutes);
 

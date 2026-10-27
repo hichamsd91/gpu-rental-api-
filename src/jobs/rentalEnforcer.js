@@ -54,6 +54,22 @@ async function sweep() {
     } catch (err) {
       console.error('[enforcer] healStuckListings failed:', err.message);
     }
+
+    // Third net: release cart holds whose TTL ran out, so an abandoned or
+    // disconnected checkout can never keep a GPU blocked.
+    try {
+      // Lazy require: keeps boot working even if the orders module cannot load.
+      const orderService = require('../services/orderService');
+      const swept = await orderService.expireStale(200);
+      if (swept.orders || swept.items) {
+        console.log(`[enforcer] expired ${swept.orders} stale order hold(s), ${swept.items} item(s)`);
+      }
+    } catch (err) {
+      // 503 while migration 013 is pending is expected, not an error to spam.
+      if (err.code !== 'orders_unavailable') {
+        console.error('[enforcer] order hold sweep failed:', err.message);
+      }
+    }
   } catch (err) {
     console.error('[enforcer] sweep failed:', err.message);
   }
