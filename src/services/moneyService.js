@@ -10,7 +10,6 @@ const { getSupabaseClient } = require('../config/supabase');
 const catalog = require('./catalogService');
 const { isMissingSchema } = catalog;
 const stripe = require('./stripeService');
-const ledger = require('./ledgerService');
 const crypto = require('crypto');
 
 const TABLES = {

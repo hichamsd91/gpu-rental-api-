@@ -6,8 +6,6 @@
  * rest of the platform keeps working in dev/test without credentials. Money
  * intake endpoints answer a clean 503 `stripe_unavailable` when disabled.
  */
-const { isProduction } = require('../config/env');
-
 let stripeClient = null;
 let stripeLoadError = null;
 
@@ -40,8 +38,6 @@ const requireClient = () => {
   }
   return client;
 };
-
-const currencyMinorFactor = (currency) => (currency === 'JPY' || currency === 'KRW' ? 1 : 100);
 
 const toStripeAmount = (minor, currency) => {
   // Stripe expects the smallest currency unit; for zero-decimal currencies the
@@ -135,7 +131,6 @@ module.exports = {
   isStripeConfigured,
   getClient,
   requireClient,
-  currencyMinorFactor,
   createPaymentIntent,
   retrievePaymentIntent,
   cancelPaymentIntent,

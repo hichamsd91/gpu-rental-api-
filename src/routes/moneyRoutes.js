@@ -12,8 +12,6 @@ const stripe = require('../services/stripeService');
 const { auth, providerAuth, renterAuth } = require('../middleware/auth');
 const { isUuid } = require('../middleware/validation');
 
-const moneyOff = (res) => res.status(503).json({ success: false, code: 'money_unavailable', message: 'Money features are not available on this deployment yet.' });
-
 const stripeOff = (res) => res.status(503).json({ success: false, code: 'stripe_unavailable', message: 'Stripe is not configured on this deployment.' });
 
 const handleError = (error, res) => {
@@ -112,8 +110,6 @@ router.post('/webhooks/stripe', async (req, res) => {
         break;
       }
       case 'account.updated': {
-        const acct = event.data.object;
-        // refresh any matching provider account lazily via a lookup is not possible here;
         // providers refresh on next /stripe-account/refresh call.
         break;
       }
@@ -184,7 +180,7 @@ router.post('/refunds', auth, renterAuth, async (req, res) => {
       try {
         const sr = await stripe.createRefund({ paymentIntentId, amountMinor, reason: reason === 'duplicate' ? 'duplicate' : 'requested_by_customer', idempotencyKey: idempotencyKey || req.get('Idempotency-Key') });
         await money.updateRefundStatus(record.id, 'succeeded', sr.id);
-      } catch (e) {
+      } catch {
         await money.updateRefundStatus(record.id, 'failed');
       }
     }
@@ -210,6 +206,7 @@ router.post('/invoices', auth, async (req, res) => {
   } catch (error) { handleError(error, res); }
 });
 
+// eslint-disable-next-line no-unused-vars
 router.use((error, req, res, next) => {
   if (error instanceof money.MoneyUnavailable || error instanceof money.MoneyError) {
     return res.status(error.status || 400).json({ success: false, code: error.code, message: error.message, ...(error.extra || {}) });

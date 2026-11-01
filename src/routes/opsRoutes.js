@@ -77,6 +77,7 @@ router.post('/notifications/read-all', auth, async (req, res) => {
   } catch (e) { handleError(e, res); }
 });
 
+// eslint-disable-next-line no-unused-vars
 router.use((error, req, res, next) => {
   if (error instanceof ops.OpsUnavailable || error instanceof ops.OpsError) {
     return res.status(error.status || 400).json({ success: false, code: error.code, message: error.message });

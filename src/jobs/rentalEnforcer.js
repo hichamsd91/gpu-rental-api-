@@ -11,7 +11,7 @@ let initialTimer = null;
 
 async function sweepOne(rental) {
   if (rental.status === 'active') {
-    const settled = await RentalService.settleRental(rental.id, 'auto_expired');
+    await RentalService.settleRental(rental.id, 'auto_expired');
     console.log(`[enforcer] auto-settled rental ${rental.id}`);
   } else if (rental.status === 'pending') {
     await RentalService.expirePendingRental(rental.id);

@@ -55,6 +55,7 @@ router.post('/disputes/:id/resolve', auth, adminAuth, async (req, res) => {
   } catch (e) { handleError(e, res); }
 });
 
+// eslint-disable-next-line no-unused-vars
 router.use((error, req, res, next) => {
   if (error instanceof rep.ReputationUnavailable || error instanceof rep.ReputationError) {
     return res.status(error.status || 400).json({ success: false, code: error.code, message: error.message });

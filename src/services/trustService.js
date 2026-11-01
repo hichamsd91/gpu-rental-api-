@@ -29,7 +29,6 @@ const findCluster = async (signalType, signalValue) => {
 
 const isBanned = async (userId) => {
   try {
-    const now = new Date().toISOString();
     const { data, error } = await client().from('account_bans').select('*').eq('user_id', userId).is('lifted_at', null);
     if (error) { failOpen(error); return false; }
     for (const b of data || []) {

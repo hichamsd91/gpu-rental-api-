@@ -24,6 +24,7 @@ const rentalRoutes = require('./routes/rentalRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const sessionRoutes = require('./routes/sessionRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
+const rentalEnforcer = require('./jobs/rentalEnforcer');
 const keepAlive = require('./jobs/keepAlive');
 
 const app = express();
