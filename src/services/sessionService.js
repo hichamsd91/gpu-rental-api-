@@ -136,8 +136,8 @@ const markDiskWipe = async (id, status, error = null) => {
   if (status === 'running') patch.started_at = new Date().toISOString();
   if (status === 'done' || status === 'failed') patch.finished_at = new Date().toISOString();
   if (error) patch.error = error;
-  try { const { data, err } = await client().from('session_disk_wipes').update(patch).eq('id', id).select().single();
-    if (err) { p5FailOpen(err); return null; } return p5Camel(data); } catch (e) { p5FailOpen(e); }
+  try { const { data, error } = await client().from('session_disk_wipes').update(patch).eq('id', id).select().single();
+    if (error) { p5FailOpen(error); return null; } return p5Camel(data); } catch (e) { p5FailOpen(e); }
 };
 const idleRentals = async (idleMs = 5*60*1000) => {
   try { const cutoff = new Date(Date.now()-idleMs).toISOString();
