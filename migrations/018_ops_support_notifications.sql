@@ -45,6 +45,11 @@ create table if not exists public.admin_audit_log (
 );
 create index if not exists idx_admin_audit_time on public.admin_audit_log(created_at desc);
 
+ALTER TABLE public.support_tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ticket_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_audit_log ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.admin_audit_log;
 -- drop table if exists public.notifications;

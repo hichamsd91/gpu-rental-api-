@@ -1127,6 +1127,14 @@ $$;
 grant execute on function public.release_escrow(uuid, uuid, integer, text) to service_role;
 grant execute on function public.refund_escrow(uuid, uuid, bigint, text) to service_role;
 
+-- Row Level Security: service_role only (API-only DB pattern).
+ALTER TABLE public.stripe_accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payment_intents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.escrow_holds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payouts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.refunds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop function if exists public.refund_escrow(uuid, uuid, bigint, text);
 -- drop function if exists public.release_escrow(uuid, uuid, integer, text);
@@ -1193,6 +1201,11 @@ create table if not exists public.session_disk_wipes (
   created_at timestamptz not null default now()
 );
 
+ALTER TABLE public.session_heartbeats ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_ssh_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_disk_wipes ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.session_disk_wipes;
 -- drop table if exists public.session_ssh_keys;
@@ -1257,6 +1270,11 @@ create table if not exists public.fraud_alerts (
 );
 create index if not exists idx_fraud_alerts_status on public.fraud_alerts(status, created_at desc);
 
+ALTER TABLE public.identity_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.device_fingerprints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.account_bans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.fraud_alerts ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.fraud_alerts;
 -- drop table if exists public.account_bans;
@@ -1299,6 +1317,9 @@ create table if not exists public.disputes (
   resolved_at timestamptz
 );
 create index if not exists idx_disputes_status on public.disputes(status, created_at desc);
+
+ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.disputes ENABLE ROW LEVEL SECURITY;
 
 -- ROLLBACK:
 -- drop table if exists public.disputes;
@@ -1356,6 +1377,11 @@ create table if not exists public.admin_audit_log (
   created_at timestamptz not null default now()
 );
 create index if not exists idx_admin_audit_time on public.admin_audit_log(created_at desc);
+
+ALTER TABLE public.support_tickets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ticket_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_audit_log ENABLE ROW LEVEL SECURITY;
 
 -- ROLLBACK:
 -- drop table if exists public.admin_audit_log;

@@ -48,6 +48,11 @@ create table if not exists public.session_disk_wipes (
   created_at timestamptz not null default now()
 );
 
+ALTER TABLE public.session_heartbeats ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_ssh_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_disk_wipes ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.session_disk_wipes;
 -- drop table if exists public.session_ssh_keys;

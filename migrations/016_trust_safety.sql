@@ -50,6 +50,11 @@ create table if not exists public.fraud_alerts (
 );
 create index if not exists idx_fraud_alerts_status on public.fraud_alerts(status, created_at desc);
 
+ALTER TABLE public.identity_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.device_fingerprints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.account_bans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.fraud_alerts ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.fraud_alerts;
 -- drop table if exists public.account_bans;

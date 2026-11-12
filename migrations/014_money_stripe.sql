@@ -238,6 +238,14 @@ $$;
 grant execute on function public.release_escrow(uuid, uuid, integer, text) to service_role;
 grant execute on function public.refund_escrow(uuid, uuid, bigint, text) to service_role;
 
+-- Row Level Security: service_role only (API-only DB pattern).
+ALTER TABLE public.stripe_accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payment_intents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.escrow_holds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payouts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.refunds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop function if exists public.refund_escrow(uuid, uuid, bigint, text);
 -- drop function if exists public.release_escrow(uuid, uuid, integer, text);

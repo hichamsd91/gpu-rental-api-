@@ -29,6 +29,9 @@ create table if not exists public.disputes (
 );
 create index if not exists idx_disputes_status on public.disputes(status, created_at desc);
 
+ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.disputes ENABLE ROW LEVEL SECURITY;
+
 -- ROLLBACK:
 -- drop table if exists public.disputes;
 -- drop table if exists public.reviews;
