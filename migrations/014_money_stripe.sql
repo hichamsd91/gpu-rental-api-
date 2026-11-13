@@ -6,7 +6,7 @@
 -- ─── Stripe Connect accounts (providers) ─────────────────────────────────────
 create table if not exists public.stripe_accounts (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   stripe_account_id text not null unique,
   onboarding_status text not null default 'pending' check (onboarding_status in ('pending','in_progress','complete','restricted')),
   charges_enabled boolean not null default false,
@@ -24,7 +24,7 @@ create index if not exists idx_stripe_accounts_user on public.stripe_accounts(us
 -- ─── Payment intents (money intake) ───────────────────────────────────────────
 create table if not exists public.payment_intents (
   id text primary key,                       -- Stripe PaymentIntent id (pi_...)
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   amount_minor bigint not null check (amount_minor > 0),
   currency text not null default 'USD',
   status text not null default 'requires_payment_method'
@@ -63,7 +63,7 @@ create index if not exists idx_escrow_holds_status on public.escrow_holds(status
 -- ─── Payouts (T+7 to providers) ──────────────────────────────────────────────
 create table if not exists public.payouts (
   id uuid primary key default gen_random_uuid(),
-  provider_id uuid not null references public.users(id) on delete cascade,
+  provider_id uuid not null references public.profiles(id) on delete cascade,
   amount_minor bigint not null check (amount_minor > 0),
   currency text not null default 'USD',
   status text not null default 'scheduled'
@@ -102,7 +102,7 @@ create index if not exists idx_refunds_payment_intent on public.refunds(payment_
 -- ─── Invoices ────────────────────────────────────────────────────────────────
 create table if not exists public.invoices (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   rental_id uuid references public.rentals(id) on delete set null,
   order_id uuid references public.orders(id) on delete set null,
   amount_minor bigint not null check (amount_minor >= 0),

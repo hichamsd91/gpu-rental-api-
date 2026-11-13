@@ -895,7 +895,7 @@ GRANT EXECUTE ON FUNCTION public.order_expire_stale(integer) TO service_role;
 -- ─── Stripe Connect accounts (providers) ─────────────────────────────────────
 create table if not exists public.stripe_accounts (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   stripe_account_id text not null unique,
   onboarding_status text not null default 'pending' check (onboarding_status in ('pending','in_progress','complete','restricted')),
   charges_enabled boolean not null default false,
@@ -913,7 +913,7 @@ create index if not exists idx_stripe_accounts_user on public.stripe_accounts(us
 -- ─── Payment intents (money intake) ───────────────────────────────────────────
 create table if not exists public.payment_intents (
   id text primary key,                       -- Stripe PaymentIntent id (pi_...)
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   amount_minor bigint not null check (amount_minor > 0),
   currency text not null default 'USD',
   status text not null default 'requires_payment_method'
@@ -952,7 +952,7 @@ create index if not exists idx_escrow_holds_status on public.escrow_holds(status
 -- ─── Payouts (T+7 to providers) ──────────────────────────────────────────────
 create table if not exists public.payouts (
   id uuid primary key default gen_random_uuid(),
-  provider_id uuid not null references public.users(id) on delete cascade,
+  provider_id uuid not null references public.profiles(id) on delete cascade,
   amount_minor bigint not null check (amount_minor > 0),
   currency text not null default 'USD',
   status text not null default 'scheduled'
@@ -991,7 +991,7 @@ create index if not exists idx_refunds_payment_intent on public.refunds(payment_
 -- ─── Invoices ────────────────────────────────────────────────────────────────
 create table if not exists public.invoices (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   rental_id uuid references public.rentals(id) on delete set null,
   order_id uuid references public.orders(id) on delete set null,
   amount_minor bigint not null check (amount_minor >= 0),
@@ -1219,9 +1219,9 @@ ALTER TABLE public.session_disk_wipes ENABLE ROW LEVEL SECURITY;
 -- ============================================================
 
 -- Migration 016: Trust & safety — identity clusters, device fingerprints, bans, fraud signals (Phase 6)
-create table if not exists public.identity_links (
+create table if not exists public.trust_identity_signals (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   signal_type text not null check (signal_type in ('email','phone','device','card','ip','wallet','ssh_key')),
   signal_value text not null,
   cluster_id uuid,
@@ -1229,12 +1229,12 @@ create table if not exists public.identity_links (
   created_at timestamptz not null default now(),
   unique (user_id, signal_type, signal_value)
 );
-create index if not exists idx_identity_links_value on public.identity_links(signal_type, signal_value);
-create index if not exists idx_identity_links_cluster on public.identity_links(cluster_id);
+create index if not exists idx_identity_links_value on public.trust_identity_signals(signal_type, signal_value);
+create index if not exists idx_identity_links_cluster on public.trust_identity_signals(cluster_id);
 
-create table if not exists public.device_fingerprints (
+create table if not exists public.trust_device_fingerprints (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid references public.users(id) on delete cascade,
+  user_id uuid references public.profiles(id) on delete cascade,
   fingerprint text not null,
   user_agent text,
   ip_address text,
@@ -1243,22 +1243,22 @@ create table if not exists public.device_fingerprints (
   unique (fingerprint)
 );
 
-create table if not exists public.account_bans (
+create table if not exists public.trust_account_bans (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   reason text not null,
   scope text not null default 'account' check (scope in ('account','device','cluster','payment')),
-  banned_by uuid references public.users(id),
+  banned_by uuid references public.profiles(id),
   expires_at timestamptz,
   created_at timestamptz not null default now(),
   lifted_at timestamptz,
-  lifted_by uuid references public.users(id)
+  lifted_by uuid references public.profiles(id)
 );
-create index if not exists idx_bans_user on public.account_bans(user_id) where lifted_at is null;
+create index if not exists idx_bans_user on public.trust_account_bans(user_id) where lifted_at is null;
 
-create table if not exists public.fraud_alerts (
+create table if not exists public.trust_fraud_alerts (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid references public.users(id) on delete cascade,
+  user_id uuid references public.profiles(id) on delete cascade,
   cluster_id uuid,
   alert_type text not null,
   severity text not null default 'low' check (severity in ('low','medium','high','critical')),
@@ -1266,20 +1266,20 @@ create table if not exists public.fraud_alerts (
   status text not null default 'open' check (status in ('open','reviewing','resolved','dismissed')),
   created_at timestamptz not null default now(),
   resolved_at timestamptz,
-  resolved_by uuid references public.users(id)
+  resolved_by uuid references public.profiles(id)
 );
-create index if not exists idx_fraud_alerts_status on public.fraud_alerts(status, created_at desc);
+create index if not exists idx_fraud_alerts_status on public.trust_fraud_alerts(status, created_at desc);
 
-ALTER TABLE public.identity_links ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.device_fingerprints ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.account_bans ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.fraud_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trust_identity_signals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trust_device_fingerprints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trust_account_bans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trust_fraud_alerts ENABLE ROW LEVEL SECURITY;
 
 -- ROLLBACK:
--- drop table if exists public.fraud_alerts;
--- drop table if exists public.account_bans;
--- drop table if exists public.device_fingerprints;
--- drop table if exists public.identity_links;
+-- drop table if exists public.trust_fraud_alerts;
+-- drop table if exists public.trust_account_bans;
+-- drop table if exists public.trust_device_fingerprints;
+-- drop table if exists public.trust_identity_signals;
 
 
 
@@ -1291,8 +1291,8 @@ ALTER TABLE public.fraud_alerts ENABLE ROW LEVEL SECURITY;
 create table if not exists public.reviews (
   id uuid primary key default gen_random_uuid(),
   rental_id uuid not null references public.rentals(id) on delete cascade,
-  reviewer_id uuid not null references public.users(id) on delete cascade,
-  reviewee_id uuid not null references public.users(id) on delete cascade,
+  reviewer_id uuid not null references public.profiles(id) on delete cascade,
+  reviewee_id uuid not null references public.profiles(id) on delete cascade,
   direction text not null check (direction in ('renter_to_provider','provider_to_renter')),
   rating integer not null check (rating between 1 and 5),
   title text,
@@ -1306,13 +1306,13 @@ create index if not exists idx_reviews_reviewee on public.reviews(reviewee_id, c
 create table if not exists public.disputes (
   id uuid primary key default gen_random_uuid(),
   rental_id uuid references public.rentals(id) on delete set null,
-  opened_by uuid not null references public.users(id) on delete cascade,
-  against uuid references public.users(id) on delete set null,
+  opened_by uuid not null references public.profiles(id) on delete cascade,
+  against uuid references public.profiles(id) on delete set null,
   reason text not null,
   status text not null default 'open' check (status in ('open','investigating','resolved','dismissed')),
   resolution text,
   refund_amount_minor bigint,
-  resolved_by uuid references public.users(id),
+  resolved_by uuid references public.profiles(id),
   created_at timestamptz not null default now(),
   resolved_at timestamptz
 );
@@ -1334,12 +1334,12 @@ ALTER TABLE public.disputes ENABLE ROW LEVEL SECURITY;
 -- Migration 018: Ops — support tickets, notifications, admin audit (Phase 8)
 create table if not exists public.support_tickets (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid references public.users(id) on delete set null,
+  user_id uuid references public.profiles(id) on delete set null,
   subject text not null,
   body text not null,
   status text not null default 'open' check (status in ('open','pending','resolved','closed')),
   priority text not null default 'normal' check (priority in ('low','normal','high','urgent')),
-  assigned_to uuid references public.users(id),
+  assigned_to uuid references public.profiles(id),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   resolved_at timestamptz
@@ -1349,7 +1349,7 @@ create index if not exists idx_tickets_status on public.support_tickets(status, 
 create table if not exists public.ticket_messages (
   id uuid primary key default gen_random_uuid(),
   ticket_id uuid not null references public.support_tickets(id) on delete cascade,
-  author_id uuid references public.users(id) on delete set null,
+  author_id uuid references public.profiles(id) on delete set null,
   body text not null,
   is_internal boolean not null default false,
   created_at timestamptz not null default now()
@@ -1357,7 +1357,7 @@ create table if not exists public.ticket_messages (
 
 create table if not exists public.notifications (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.users(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
   type text not null,
   title text not null,
   body text,
@@ -1369,7 +1369,7 @@ create index if not exists idx_notifications_user on public.notifications(user_i
 
 create table if not exists public.admin_audit_log (
   id uuid primary key default gen_random_uuid(),
-  admin_id uuid references public.users(id),
+  admin_id uuid references public.profiles(id),
   action text not null,
   target_type text,
   target_id text,

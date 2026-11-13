@@ -11,7 +11,7 @@ const camel = (row) => { if (!row) return row; const o={}; for (const [k,v] of O
 
 const recordIdentitySignal = async (userId, signalType, signalValue) => {
   try {
-    const { data, error } = await client().from('identity_links').upsert(
+    const { data, error } = await client().from('trust_identity_signals').upsert(
       { user_id: userId, signal_type: signalType, signal_value: signalValue },
       { onConflict: 'user_id,signal_type,signal_value' }).select().single();
     if (error) { failOpen(error); return null; }
@@ -21,7 +21,7 @@ const recordIdentitySignal = async (userId, signalType, signalValue) => {
 
 const findCluster = async (signalType, signalValue) => {
   try {
-    const { data, error } = await client().from('identity_links').select('*').eq('signal_type', signalType).eq('signal_value', signalValue);
+    const { data, error } = await client().from('trust_identity_signals').select('*').eq('signal_type', signalType).eq('signal_value', signalValue);
     if (error) { failOpen(error); return []; }
     return (data||[]).map(camel);
   } catch (e) { failOpen(e); return []; }
@@ -29,7 +29,7 @@ const findCluster = async (signalType, signalValue) => {
 
 const isBanned = async (userId) => {
   try {
-    const { data, error } = await client().from('account_bans').select('*').eq('user_id', userId).is('lifted_at', null);
+    const { data, error } = await client().from('trust_account_bans').select('*').eq('user_id', userId).is('lifted_at', null);
     if (error) { failOpen(error); return false; }
     for (const b of data || []) {
       if (!b.expires_at || new Date(b.expires_at) > new Date()) return true;
@@ -40,7 +40,7 @@ const isBanned = async (userId) => {
 
 const banAccount = async ({ userId, reason, scope='account', bannedBy=null, expiresAt=null }) => {
   try {
-    const { data, error } = await client().from('account_bans').insert({
+    const { data, error } = await client().from('trust_account_bans').insert({
       user_id: userId, reason, scope, banned_by: bannedBy, expires_at: expiresAt
     }).select().single();
     if (error) { failOpen(error); return null; }
@@ -50,7 +50,7 @@ const banAccount = async ({ userId, reason, scope='account', bannedBy=null, expi
 
 const liftBan = async (banId, liftedBy) => {
   try {
-    const { data, error } = await client().from('account_bans').update({ lifted_at: new Date().toISOString(), lifted_by: liftedBy }).eq('id', banId).select().single();
+    const { data, error } = await client().from('trust_account_bans').update({ lifted_at: new Date().toISOString(), lifted_by: liftedBy }).eq('id', banId).select().single();
     if (error) { failOpen(error); return null; }
     return camel(data);
   } catch (e) { failOpen(e); }
@@ -58,7 +58,7 @@ const liftBan = async (banId, liftedBy) => {
 
 const recordFingerprint = async (fingerprint, userId, userAgent, ipAddress) => {
   try {
-    const { data, error } = await client().from('device_fingerprints').upsert({
+    const { data, error } = await client().from('trust_device_fingerprints').upsert({
       fingerprint, user_id: userId, user_agent: userAgent, ip_address: ipAddress, last_seen_at: new Date().toISOString()
     }, { onConflict: 'fingerprint' }).select().single();
     if (error) { failOpen(error); return null; }
@@ -68,7 +68,7 @@ const recordFingerprint = async (fingerprint, userId, userAgent, ipAddress) => {
 
 const raiseAlert = async ({ userId=null, clusterId=null, alertType, severity='low', details={} }) => {
   try {
-    const { data, error } = await client().from('fraud_alerts').insert({ user_id: userId, cluster_id: clusterId, alert_type: alertType, severity, details }).select().single();
+    const { data, error } = await client().from('trust_fraud_alerts').insert({ user_id: userId, cluster_id: clusterId, alert_type: alertType, severity, details }).select().single();
     if (error) { failOpen(error); return null; }
     return camel(data);
   } catch (e) { failOpen(e); }
@@ -76,7 +76,7 @@ const raiseAlert = async ({ userId=null, clusterId=null, alertType, severity='lo
 
 const listAlerts = async ({ status='open', limit=50 } = {}) => {
   try {
-    const { data, error } = await client().from('fraud_alerts').select('*').eq('status', status).order('created_at', { ascending: false }).limit(limit);
+    const { data, error } = await client().from('trust_fraud_alerts').select('*').eq('status', status).order('created_at', { ascending: false }).limit(limit);
     if (error) { failOpen(error); return []; }
     return (data||[]).map(camel);
   } catch (e) { failOpen(e); return []; }
@@ -84,7 +84,7 @@ const listAlerts = async ({ status='open', limit=50 } = {}) => {
 
 const resolveAlert = async (id, resolvedBy, status='resolved') => {
   try {
-    const { data, error } = await client().from('fraud_alerts').update({ status, resolved_at: new Date().toISOString(), resolved_by: resolvedBy }).eq('id', id).select().single();
+    const { data, error } = await client().from('trust_fraud_alerts').update({ status, resolved_at: new Date().toISOString(), resolved_by: resolvedBy }).eq('id', id).select().single();
     if (error) { failOpen(error); return null; }
     return camel(data);
   } catch (e) { failOpen(e); }
