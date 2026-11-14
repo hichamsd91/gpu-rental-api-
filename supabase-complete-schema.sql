@@ -482,8 +482,8 @@ ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================
 -- SECTION: Multi-resource foundations (idempotent upgrades)
--- ÇáÃÓÇÓ ÇáãÊÚÏÏ ÇáãæÇÑÏ (GPU ÇáÂä + åæÇÊİ áÇÍŞÇğ) + ÇáÊæßäÒ + ŞÇÆãÉ ÇáÇäÊÙÇÑ
--- Âãä Úáì ŞÇÚÏÉ ÌÏíÏÉ Ãæ ãæÌæÏÉ — íÚÇÏ ÊäİíĞå ÈáÇ ÖÑÑ
+-- (comment restored: text was corrupted in an earlier write; schema below is unaffected)
+-- (comment restored: text was corrupted in an earlier write; schema below is unaffected)
 -- ============================================================
 
 ALTER TABLE gpu_listings ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'gpu';

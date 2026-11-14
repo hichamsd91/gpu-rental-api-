@@ -53,3 +53,8 @@ jobs:
 
       - name: Unit tests (jest — no external databases required)
         run: npm test --ci
+
+      # Fail only on high/critical so a transitive advisory cannot block a
+      # release that has no exploitable path (current baseline: 0 findings).
+      - name: Dependency audit (prod deps, high and above)
+        run: npm audit --omit=dev --audit-level=high
