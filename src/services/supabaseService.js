@@ -6,7 +6,6 @@ const { getSupabaseClient } = require('../config/supabase');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { usdToTokens } = require('../utils/pricing');
-const { PlatformCommissionService } = require('./commissionService');
 const catalogService = require('./catalogService');
 
 const SUPABASE_TABLES = {
@@ -690,6 +689,52 @@ const healStuckListings = async (limit = 100) => {
 // ============================================
 // RENTAL SERVICE
 // ============================================
+// Escrow prepay at start: charge the full quote now, refund unused at settle.
+// The funding row is the marker settlement looks for, so a legacy in-flight
+// rental (started before this shipped) still settles through the old path.
+async function fundRentalEscrow(rentalRow) {
+  const renterId = rentalRow.renter_id || rentalRow.renterId;
+  const rentalId = rentalRow.id;
+  const plannedMinutes = Math.max(
+    1,
+    Number(rentalRow.planned_duration_minutes ?? rentalRow.plannedDurationMinutes) || 0
+  );
+  const estimate = Math.round(
+    Math.max(0, Number(rentalRow.estimated_cost ?? rentalRow.estimatedCost) || 0) * 1000
+  ) / 1000;
+  if (!(estimate > 0)) return 0;
+
+  const wallet = await WalletService.getOrCreate(renterId);
+  const available = Math.max(0, Number(wallet.balance) || 0);
+  if (Math.round(available * 1000) < Math.round(estimate * 1000)) {
+    throw Object.assign(
+      new Error(
+        `Insufficient wallet balance to start this rental. Required $${estimate.toFixed(2)} but only $${available.toFixed(2)} available.`
+      ),
+      { code: 'WALLET_INSUFFICIENT', required: estimate, available }
+    );
+  }
+
+  await WalletService.adjustBalance(renterId, -estimate, false);
+  try {
+    await TransactionService.create(
+      {
+        type: 'rental_charge',
+        status: 'completed',
+        amount: estimate,
+        relatedId: rentalId,
+        description: `Session escrow hold (refundable) — ${plannedMinutes} min`
+      },
+      renterId
+    );
+  } catch (txnError) {
+    // Never leave a debit without its audit row.
+    await WalletService.adjustBalance(renterId, estimate, false);
+    throw txnError;
+  }
+  return estimate;
+}
+
 const RentalService = {
   async findAll(userId, userRole, filters = {}, options = {}) {
     const client = getClient();
@@ -916,6 +961,24 @@ const RentalService = {
         .eq('id', id);
     }
 
+    // Prepay (escrow): the renter's wallet is charged the full quote BEFORE
+    // the machine is handed over. Settlement refunds whatever was not used.
+    // On failure the claim is undone so the renter can top up and retry.
+    try {
+      await fundRentalEscrow(rental);
+    } catch (fundError) {
+      await client
+        .from(SUPABASE_TABLES.gpu_listings)
+        .update({ status: 'active', updated_at: new Date().toISOString() })
+        .eq('id', rental.listing_id)
+        .eq('status', 'rented');
+      await client
+        .from(SUPABASE_TABLES.rentals)
+        .update({ status: 'pending', updated_at: new Date().toISOString() })
+        .eq('id', id);
+      throw fundError;
+    }
+
     // Best-effort: publish provider-configured remote access for THIS rental.
     // Never blocks the start (see attachAccessPayload — it swallows its own
     // errors and degrades when a schema object is still missing). Skipped when
@@ -931,7 +994,7 @@ const RentalService = {
     return started;
   },
 
-  async endRental(id, userId, userRole) {
+  async endRental(id, userId, userRole, endReason = 'renter_ended') {
     const rental = await this.findById(id);
     if (!rental) throw new Error('Rental not found');
 
@@ -940,58 +1003,38 @@ const RentalService = {
 
     if (rental.status !== 'active') throw new Error('Rental is not active');
 
-    // Money settlement lives in ONE place: settleRental() — used by the
-    // manual /end route AND by the auto-expiry enforcer job.
-    return this.settleRental(id, 'manual');
+    // A provider may only end a session for a declared reason — never
+    // "completed". The route validates the reason; settlement compensates.
+    return this.settleRental(id, endReason);
   },
 
   // ============================================
   // SETTLEMENT (single source of truth for money)
   // ============================================
   // Rules (docs/pricing-model.md):
-  //   - free (ad-supported) rentals always cost 0  [bug fix: they used to
-  //     be billed at the listing price]
+  //   - the renter is charged the full quote at start (escrow) and refunded
+  //     whatever the session did not use
   //   - billable minutes are floored at the listing minimum and capped at
   //     the planned duration the renter was quoted (never pay more than
   //     the estimate)
-  //   - the renter is charged only up to the available balance (the wallet
-  //     CHECK forbids negatives); the unpaid remainder is recorded as a
-  //     PENDING transaction = honest debt until the payment gateway lands
-  //   - the provider earns 100% of what was ACTUALLY collected (0%
-  //     commission — and never credit money the platform did not collect)
+  //   - the provider earns 100% of the actual amount (0% commission)
+  //   - a provider that ends a session early owes the renter a goodwill
+  //     credit (10% interactive / 2x remaining for batch work), capped by
+  //     the provider's own balance
   // Idempotent: the 'active' -> 'ended' flip is a conditional update, so a
   // manual end racing the enforcer settles exactly once.
-  //
-  // Preferred path: ONE database transaction via the settle_rental RPC
-  // (server/migrations/002_settle_rental_rpc.sql) — row-locked and exact
-  // decimal arithmetic. It closes, in a single move: the wallet race
-  // (read-balance-then-deduct), float money math, and the
-  // crash-between-steps window (peer-review fixes).
-  async settleRental(id, endReason = 'manual') {
-    const client = getClient();
-    try {
-      const { error } = await client.rpc('settle_rental', {
-        p_rental_id: id,
-        p_end_reason: endReason
-      });
-      if (error) throw error;
-      return this.findById(id);
-    } catch (rpcError) {
-      const message = String(rpcError?.message || '');
-      const missing = rpcError?.code === '42883' ||
-        rpcError?.code === 'PGRST202' ||
-        (/settle_rental/i.test(message) && /does not exist/i.test(message));
-      if (!missing) throw rpcError;
-      // Migration 002 not installed yet -> best-effort JS path below.
-      return this.settleRentalJs(id, endReason);
-    }
+  async settleRental(id, endReason = 'renter_ended') {
+    // One settlement path for every caller (renter end, provider end,
+    // enforcer expiry, heartbeat loss). Escrow-aware: if the session was
+    // prepaid at start, the unused part is refunded and the provider is paid
+    // the actual amount in full (0% platform commission).
+    return this.settleRentalFunded(id, endReason);
   },
 
-  // Best-effort JS settlement — active ONLY until the settle_rental RPC is
-  // installed. Hardened: every money step is individually guarded, the
+  // Escrow-aware settlement. Every money step is individually guarded, the
   // listing release ALWAYS runs, and a failed money step is recorded as a
-  // pending charge for manual review (no silent losses, no stuck listings).
-  async settleRentalJs(id, endReason = 'manual') {
+  // pending row for manual review (no silent losses, no stuck listings).
+  async settleRentalFunded(id, endReason = 'renter_ended') {
     const client = getClient();
     const rental = await this.findById(id);
     if (!rental || rental.status !== 'active') return rental;
@@ -1004,12 +1047,33 @@ const RentalService = {
 
     let finalCost = 0;
     let billableMinutes = 0;
+    let pricePerHour = 0;
+    let minMinutes = 1;
+    let planned = 1;
     if (rental.isFree !== true) {
-      const pricePerHour = Number(listing?.pricePerHour) || 0;
-      const minMinutes = Math.max(1, Number(listing?.minRentalMinutes) || 1);
-      const planned = Math.max(1, Number(rental.plannedDurationMinutes) || minMinutes);
+      pricePerHour = Number(listing?.pricePerHour) || 0;
+      minMinutes = Math.max(1, Number(listing?.minRentalMinutes) || 1);
+      planned = Math.max(1, Number(rental.plannedDurationMinutes) || minMinutes);
       billableMinutes = Math.min(Math.max(elapsedMinutes, minMinutes), planned);
       finalCost = Math.round((billableMinutes / 60) * pricePerHour * 1000) / 1000;
+    }
+
+    // Was this session prepaid at start? The funding row is written by
+    // fundRentalEscrow(); its absence means a legacy (pre-escrow) rental.
+    let prepaid = 0;
+    try {
+      const { data: funding } = await client
+        .from(SUPABASE_TABLES.transactions)
+        .select('amount')
+        .eq('related_id', id)
+        .eq('user_id', rental.renterId)
+        .eq('type', 'rental_charge')
+        .eq('status', 'completed')
+        .like('description', 'Session escrow hold%')
+        .maybeSingle();
+      prepaid = Math.max(0, Number(funding?.amount) || 0);
+    } catch (lookupError) {
+      console.error(`[settlement] escrow lookup failed for rental ${id}:`, lookupError.message);
     }
 
     // Atomic close: only one caller wins the 'active' -> 'ended' flip
@@ -1037,7 +1101,35 @@ const RentalService = {
     let providerOwedAmount = 0; // 95% of what was collected (after the 5% cut)
     let providerCredited = false;
     try {
-      if (finalCost > 0) {
+      if (prepaid > 0) {
+        // ── Escrow path: money was taken at start ─────────────────────
+        const refund = Math.round(Math.max(0, prepaid - finalCost) * 1000) / 1000;
+        if (refund > 0) {
+          await WalletService.adjustBalance(rental.renterId, refund, false);
+          await TransactionService.create({
+            type: 'refund',
+            status: 'completed',
+            amount: refund,
+            relatedId: id,
+            description: `Unused session time refunded (${billableMinutes} min billed of ${planned} planned)`
+          }, rental.renterId);
+        }
+
+        // 0% platform commission: the provider keeps the whole amount.
+        providerOwedAmount = finalCost;
+        if (finalCost > 0 && rental.providerId) {
+          await WalletService.adjustBalance(rental.providerId, finalCost, true);
+          providerCredited = true;
+          await TransactionService.create({
+            type: 'provider_earning',
+            status: 'completed',
+            amount: finalCost,
+            relatedId: id,
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+          }, rental.providerId);
+        }
+      } else if (finalCost > 0) {
+        // ── Legacy path: rental started before escrow shipped ─────────
         const renterWallet = await WalletService.getOrCreate(rental.renterId);
         const available = Math.max(0, Number(renterWallet.balance) || 0);
         const charged = Math.round(Math.min(finalCost, available) * 1000) / 1000;
@@ -1064,45 +1156,54 @@ const RentalService = {
           }, rental.renterId);
         }
 
-        // Split of what was actually collected: 5% platform operational
-        // commission + 95% to the provider (decision: commission + ads).
-        // The fee failure must NEVER block the provider's credit.
         if (charged > 0 && rental.providerId) {
-          const { commission: platformFee, providerEarning } =
-            PlatformCommissionService.calculateCommission(
-              charged,
-              rental.isFree === true
-            );
-          providerOwedAmount = providerEarning;
-
-          if (platformFee > 0) {
-            try {
-              await WalletService.getOrCreate(PlatformCommissionService.platformUserId);
-              await WalletService.adjustBalance(
-                PlatformCommissionService.platformUserId,
-                platformFee,
-                false
-              );
-              await TransactionService.create({
-                type: 'platform_fee',
-                status: 'completed',
-                amount: platformFee,
-                relatedId: id,
-                description: 'Platform operational commission (5%)'
-              }, PlatformCommissionService.platformUserId);
-            } catch (feeError) {
-              console.error(`[settlement] platform fee post failed for rental ${id}:`, feeError.message);
-            }
-          }
-
-          await WalletService.adjustBalance(rental.providerId, providerEarning, true);
+          providerOwedAmount = charged; // 0% commission: provider keeps 100%
+          await WalletService.adjustBalance(rental.providerId, charged, true);
           providerCredited = true;
           await TransactionService.create({
             type: 'provider_earning',
             status: 'completed',
-            amount: providerEarning,
+            amount: charged,
             relatedId: id,
-            description: `Rental earnings (${elapsedMinutes} min session, after 5% platform commission)`
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+          }, rental.providerId);
+        }
+      }
+
+      // ── Provider-caused interruption: goodwill credit ────────────────
+      // Interactive sessions: 10% of the planned value.
+      // Batch work (training/rendering): 2x the value of the remaining time.
+      // Always paid by the provider (never the platform), capped by their
+      // balance so a wallet can never go negative.
+      if (String(endReason).startsWith('provider_ended') && rental.providerId && finalCost > 0) {
+        const remaining = Math.max(0, planned - Math.min(elapsedMinutes, planned));
+        const plannedValue = Math.round((planned / 60) * pricePerHour * 1000) / 1000;
+        const batch = ['training', 'rendering'].includes(String(rental.purpose || ''));
+        let due = batch
+          ? Math.round(2 * (remaining / 60) * pricePerHour * 1000) / 1000
+          : Math.round(plannedValue * 0.10 * 1000) / 1000;
+        if (batch && due <= 0) {
+          due = Math.round(plannedValue * 0.10 * 1000) / 1000;
+        }
+        const providerWallet = await WalletService.findByUserId(rental.providerId);
+        const providerBalance = Math.max(0, Number(providerWallet?.balance) || 0);
+        const comp = Math.round(Math.min(due, providerBalance) * 1000) / 1000;
+        if (comp > 0) {
+          await WalletService.adjustBalance(rental.providerId, -comp, false);
+          await WalletService.adjustBalance(rental.renterId, comp, false);
+          await TransactionService.create({
+            type: 'refund',
+            status: 'completed',
+            amount: comp,
+            relatedId: id,
+            description: `Goodwill credit — provider ended the session early (${endReason})`
+          }, rental.renterId);
+          await TransactionService.create({
+            type: 'refund',
+            status: 'completed',
+            amount: -comp,
+            relatedId: id,
+            description: `Provider early-end compensation (${endReason})`
           }, rental.providerId);
         }
       }
@@ -1126,7 +1227,7 @@ const RentalService = {
     if (moneyError) {
       // Audit ONLY what truly has no ledger row — never re-bill an amount
       // that already left the renter's wallet (peer-review fix)
-      if (finalCost > 0 && !renterCharged) {
+      if (prepaid === 0 && finalCost > 0 && !renterCharged) {
         try {
           await TransactionService.create({
             type: 'rental_charge',

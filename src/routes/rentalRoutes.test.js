@@ -285,6 +285,92 @@ describe('POST /api/rentals — purposes, availability and mining (Phase 2)', ()
   });
 });
 
+describe('POST /api/rentals/:id/end — provider guard + retired free tier', () => {
+  const RENTAL_ID = '44444444-4444-4444-8444-444444444444';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUser = { id: 'renter-1', role: 'renter' };
+    RentalService.endRental.mockResolvedValue({ id: RENTAL_ID, status: 'ended' });
+  });
+
+  test('free ad-supported sessions are gone (410, no rental created)', async () => {
+    const response = await request(app)
+      .post('/api/rentals/free')
+      .send({ listingId: 'listing-1' });
+
+    expect(response.status).toBe(410);
+    expect(response.body.code).toBe('free_sessions_retired');
+    expect(RentalService.create).not.toHaveBeenCalled();
+  });
+
+  test('a provider must declare why they ended the session', async () => {
+    mockUser = { id: 'provider-1', role: 'provider' };
+
+    const response = await request(app)
+      .post(`/api/rentals/${RENTAL_ID}/end`)
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('provider_reason_required');
+    expect(RentalService.endRental).not.toHaveBeenCalled();
+  });
+
+  test('a provider cannot end a session as "completed"', async () => {
+    mockUser = { id: 'provider-1', role: 'provider' };
+
+    const response = await request(app)
+      .post(`/api/rentals/${RENTAL_ID}/end`)
+      .send({ reason: 'completed' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('provider_reason_required');
+  });
+
+  test('a declared provider end is recorded and settles with compensation', async () => {
+    mockUser = { id: 'provider-1', role: 'provider' };
+
+    const response = await request(app)
+      .post(`/api/rentals/${RENTAL_ID}/end`)
+      .send({ reason: 'hardware_failure' });
+
+    expect(response.status).toBe(200);
+    expect(RentalService.endRental).toHaveBeenCalledWith(
+      RENTAL_ID,
+      'provider-1',
+      'provider',
+      'provider_ended:hardware_failure'
+    );
+  });
+
+  test('the renter always ends their own session without a reason', async () => {
+    const response = await request(app)
+      .post(`/api/rentals/${RENTAL_ID}/end`)
+      .send({});
+
+    expect(response.status).toBe(200);
+    expect(RentalService.endRental).toHaveBeenCalledWith(
+      RENTAL_ID,
+      'renter-1',
+      'renter',
+      'renter_ended'
+    );
+  });
+
+  test('admin ends stay neutral (no provider penalty)', async () => {
+    mockUser = { id: 'admin-1', role: 'admin' };
+
+    await request(app).post(`/api/rentals/${RENTAL_ID}/end`).send({});
+
+    expect(RentalService.endRental).toHaveBeenCalledWith(
+      RENTAL_ID,
+      'admin-1',
+      'admin',
+      'admin_ended'
+    );
+  });
+});
+
 describe('GET /api/rentals/:id (owner-scoped read)', () => {
   // Route params are uuids in production, so the fixtures have to be uuids too:
   // the router.param guard rejects anything else before the handler runs.

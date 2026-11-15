@@ -236,67 +236,17 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// @desc    Create FREE ad-supported rental (2 hours)
+// @desc    Free ad-supported rentals — retired
 // @route   POST /api/rentals/free
 // @access  Private/Renter
-router.post('/free', auth, async (req, res) => {
-  try {
-    if (req.user.role !== 'renter') {
-      return res.status(403).json({ message: 'Only renters can create rentals' });
-    }
-
-    const { listingId } = req.body;
-    if (!listingId) {
-      return res.status(400).json({ message: 'listingId is required' });
-    }
-
-    const listing = await GpuListingService.findById(listingId);
-    if (!listing) {
-      return res.status(404).json({ message: 'Listing not found' });
-    }
-
-    if (listing.status !== 'active') {
-      return res.status(400).json({ message: 'Listing is not available' });
-    }
-
-    // Create free rental with 2 hours (120 minutes), cost = 0
-    const freeDurationMinutes = 120; // 2 hours free
-    const rental = await RentalService.createFree({
-      listingId,
-      providerId: listing.providerId,
-      plannedDurationMinutes: freeDurationMinutes,
-      estimatedCost: 0,
-      isFree: true
-    }, req.user.id);
-
-    // Generate lightweight connection payload for signaling
-    const connectionPayload = {
-      rentalId: rental.id,
-      listingId: listing.id,
-      providerId: listing.providerId,
-      renterId: req.user.id,
-      deviceId: listing.deviceId,
-      startedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(), // 2 hours
-      isFree: true,
-      sessionType: 'free_ad_supported'
-    };
-
-    // Emit signaling event via Supabase realtime (handled by RentalService.createFree)
-    res.status(201).json({ 
-      success: true, 
-      rental: { 
-        ...rental, 
-        connectionPayload 
-      } 
-    });
-  } catch (error) {
-    console.error('Create free rental error:', error);
-    if (isValidationError(error)) {
-      return res.status(400).json({ message: error.message });
-    }
-    res.status(500).json({ message: 'Server error' });
-  }
+// The 2-hour free tier was removed by owner decision: it shifted the cost onto
+// the provider (who donated two hours of hardware) and made hosts leave.
+router.post('/free', auth, (req, res) => {
+  res.status(410).json({
+    success: false,
+    code: 'free_sessions_retired',
+    message: 'Free ad-supported sessions have been retired. Book a paid session instead.'
+  });
 });
 
 // @desc    Start rental
@@ -338,12 +288,39 @@ router.post('/:id/start', auth, async (req, res) => {
   }
 });
 
+// Allowed provider-side reasons to end a running session. A provider can never
+// end a session as "completed" — they are the supplier, not the buyer.
+const PROVIDER_END_REASONS = new Set(['maintenance', 'hardware_failure', 'emergency']);
+
 // @desc    End rental
 // @route   POST /api/rentals/:id/end
 // @access  Private
 router.post('/:id/end', auth, async (req, res) => {
   try {
-    const endedRental = await RentalService.endRental(req.params.id, req.user.id, req.user.role);
+    const isProviderOnly = req.user.role === 'provider';
+    const rawReason = req.body && req.body.reason ? String(req.body.reason).trim() : '';
+
+    let endReason;
+    if (isProviderOnly) {
+      if (!PROVIDER_END_REASONS.has(rawReason)) {
+        return res.status(400).json({
+          success: false,
+          code: 'provider_reason_required',
+          message: 'A provider must end a session with a reason: maintenance, hardware_failure or emergency.',
+          allowed: [...PROVIDER_END_REASONS]
+        });
+      }
+      endReason = `provider_ended:${rawReason}`;
+    } else {
+      endReason = req.user.role === 'admin' ? 'admin_ended' : 'renter_ended';
+    }
+
+    const endedRental = await RentalService.endRental(
+      req.params.id,
+      req.user.id,
+      req.user.role,
+      endReason
+    );
     res.json({ success: true, rental: endedRental });
   } catch (error) {
     console.error('End rental error:', error);

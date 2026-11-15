@@ -1,23 +1,23 @@
 // ============================================================
-// Platform commission model — قرار المالك: 5% عمولة تشغيلية + إعلانات
+// Platform commission model — owner decision (2026-11-15): 0%
 // ------------------------------------------------------------
-// - الإيجارات المدفوعة: المنصة تأخذ 5% من المبلغ المحصّل فعلاً،
-//   والمؤجّر يأخذ 95%. المستأجر يدفع دائماً السعر المعروض تماماً
-//   (العمولة تخرج من نصيب المؤجّر لا من جيب المستأجر).
-// - الإيجارات المجانية (التي تُموّلها الإعلانات): عمولة 0% —
-//   الإعلان هو مصدر الدخل عنها، لا المستأجر.
-// - المبلغ غير المحصّل (محفظة المستأجر لا تكفي) لا تُقتطع منه
-//   أي عمولة — لا عمولة على مال لم يُجمع.
+// The platform takes NO cut of a rental. The provider keeps 100%
+// of the amount the session actually costs. Revenue comes from
+// ads/sponsorship, never from the rental margin.
 //
-// IMPORTANT: هذا المعدل (0.05) وحساب المنصة (PLATFORM_USER_ID)
-// متطابقان يدوياً مع migrations/003_settle_commission_5pct.sql —
-// أي تغيير هنا يتطلب إعادة تشغيل الـ migration ذاته.
+// The renter pays the displayed price; the provider receives it
+// in full. Interruption compensation (provider ends early) is
+// funded by the provider's own balance, not by the platform.
+//
+// NOTE: settlement now lives in supabaseService.settleRentalFunded
+// (escrow aware). This service is kept for compatibility with the
+// existing routes/tests and reads the same zero rate.
 // ============================================================
 
-const COMMISSION_RATE = 0.05;
+const COMMISSION_RATE = 0;
 
-// حساب المنصة الثابت في السجلّ (يُنشأ في migration 003):
-// profiles + wallets بنفس المعرّف هذا — كل المسارات تتفق عليه.
+// Platform ledger account id (created by migration 003). Kept so any
+// historical platform_fee rows still resolve to a real profile.
 const PLATFORM_USER_ID = '00000000-0000-4000-8000-000000000001';
 
 const round3 = (value) => Math.round((Number(value) || 0) * 1000) / 1000;
@@ -26,31 +26,27 @@ const PlatformCommissionService = {
   rate: COMMISSION_RATE,
   platformUserId: PLATFORM_USER_ID,
 
-  // يرجع تقسيم المبلغ المحصّل: { total, commission, providerEarning }
-  // (fee + earning يتبادلان المبلغ بالضبط — لا دولار يضيع ولا يُخلَق)
-  calculateCommission(amount, isFree = false) {
+  // Returns the split of the collected amount: { total, commission, providerEarning }
+  // (fee + earning equal the amount exactly — no dollar is lost or created)
+  calculateCommission(amount) {
     const total = round3(amount);
-    const commission = (isFree || total <= 0)
-      ? 0
-      : round3(total * COMMISSION_RATE);
     return {
       total,
-      commission,
-      providerEarning: round3(total - commission)
+      commission: 0,
+      providerEarning: total
     };
   },
 
-  async processRentalPayment(rental, listing) {
+  async processRentalPayment(rental) {
     const actualCost = rental.actualCost || rental.estimatedCost;
-    const isFree = rental.isFree === true;
-    const commission = this.calculateCommission(actualCost, isFree);
+    const split = this.calculateCommission(actualCost);
 
     return {
       success: true,
       breakdown: {
-        total: commission.total,
-        platformCommission: commission.commission,
-        providerEarning: commission.providerEarning
+        total: split.total,
+        platformCommission: split.commission,
+        providerEarning: split.providerEarning
       }
     };
   }
