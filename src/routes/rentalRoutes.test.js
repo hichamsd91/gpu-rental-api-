@@ -50,6 +50,9 @@ app.use(express.json());
 app.use('/api/rentals', rentalRoutes);
 
 describe('rental lifecycle hardening', () => {
+  // /api/rentals/:id only accepts uuids (router.param guard).
+  const RENTAL_ID = '11111111-1111-4111-8111-111111111111';
+
   beforeEach(() => {
     mockUser = { id: 'renter-1', role: 'renter' };
     jest.clearAllMocks();
@@ -76,13 +79,13 @@ describe('rental lifecycle hardening', () => {
 
   test('does not allow another renter to start a rental', async () => {
     RentalService.findById.mockResolvedValue({
-      id: 'rental-1',
+      id: RENTAL_ID,
       renterId: 'renter-2',
       providerId: 'provider-1',
       status: 'pending'
     });
 
-    const response = await request(app).post('/api/rentals/rental-1/start');
+    const response = await request(app).post(`/api/rentals/${RENTAL_ID}/start`);
 
     expect(response.status).toBe(403);
     expect(RentalService.startRental).not.toHaveBeenCalled();
@@ -94,7 +97,7 @@ describe('rental lifecycle hardening', () => {
       callCount += 1;
       // First call: return pending, second call: return pending (simulating race condition)
       return {
-        id: 'rental-1',
+        id: RENTAL_ID,
         listingId: 'listing-1',
         renterId: 'renter-1',
         providerId: 'provider-1',
@@ -107,7 +110,7 @@ describe('rental lifecycle hardening', () => {
       startCallCount += 1;
       if (startCallCount === 1) {
         return {
-          id: 'rental-1',
+          id: RENTAL_ID,
           listingId: 'listing-1',
           renterId: 'renter-1',
           providerId: 'provider-1',
@@ -122,8 +125,8 @@ describe('rental lifecycle hardening', () => {
     });
 
     const responses = await Promise.all([
-      request(app).post('/api/rentals/rental-1/start'),
-      request(app).post('/api/rentals/rental-1/start')
+      request(app).post(`/api/rentals/${RENTAL_ID}/start`),
+      request(app).post(`/api/rentals/${RENTAL_ID}/start`)
     ]);
 
     // Current implementation returns 500 for generic errors (could be improved to 409)
@@ -134,7 +137,7 @@ describe('rental lifecycle hardening', () => {
 
   test('maps a wallet-insufficient rejection from start to 402 with a stable code', async () => {
     RentalService.findById.mockResolvedValue({
-      id: 'rental-1',
+      id: RENTAL_ID,
       renterId: 'renter-1',
       providerId: 'provider-1',
       status: 'pending'
@@ -146,7 +149,7 @@ describe('rental lifecycle hardening', () => {
     err.available = 0;
     RentalService.startRental.mockRejectedValue(err);
 
-    const response = await request(app).post('/api/rentals/rental-1/start').send({ plannedMinutes: 60 });
+    const response = await request(app).post(`/api/rentals/${RENTAL_ID}/start`).send({ plannedMinutes: 60 });
 
     expect(response.status).toBe(402);
     expect(response.body.success).toBe(false);
@@ -283,7 +286,11 @@ describe('POST /api/rentals — purposes, availability and mining (Phase 2)', ()
 });
 
 describe('GET /api/rentals/:id (owner-scoped read)', () => {
-  const rental = { id: 'r-1', renterId: 'u-renter', providerId: 'u-provider', status: 'active' };
+  // Route params are uuids in production, so the fixtures have to be uuids too:
+  // the router.param guard rejects anything else before the handler runs.
+  const RENTAL_ID = '22222222-2222-4222-8222-222222222222';
+  const MISSING_ID = '33333333-3333-4333-8333-333333333333';
+  const rental = { id: RENTAL_ID, renterId: 'u-renter', providerId: 'u-provider', status: 'active' };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -293,16 +300,16 @@ describe('GET /api/rentals/:id (owner-scoped read)', () => {
   test('returns the row to its own renter', async () => {
     mockUser = { id: 'u-renter', role: 'renter' };
 
-    const response = await request(app).get('/api/rentals/r-1');
+    const response = await request(app).get(`/api/rentals/${RENTAL_ID}`);
 
     expect(response.status).toBe(200);
-    expect(response.body.rental.id).toBe('r-1');
+    expect(response.body.rental.id).toBe(RENTAL_ID);
   });
 
   test("returns the row to its own provider", async () => {
     mockUser = { id: 'u-provider', role: 'provider' };
 
-    const response = await request(app).get('/api/rentals/r-1');
+    const response = await request(app).get(`/api/rentals/${RENTAL_ID}`);
 
     expect(response.status).toBe(200);
   });
@@ -310,7 +317,7 @@ describe('GET /api/rentals/:id (owner-scoped read)', () => {
   test('returns the row to an admin', async () => {
     mockUser = { id: 'u-admin', role: 'admin' };
 
-    const response = await request(app).get('/api/rentals/r-1');
+    const response = await request(app).get(`/api/rentals/${RENTAL_ID}`);
 
     expect(response.status).toBe(200);
   });
@@ -318,11 +325,33 @@ describe('GET /api/rentals/:id (owner-scoped read)', () => {
   test('blocks a stranger (403) and answers a missing row with a clean 404', async () => {
     mockUser = { id: 'u-other', role: 'renter' };
 
-    const denied = await request(app).get('/api/rentals/r-1');
+    const denied = await request(app).get(`/api/rentals/${RENTAL_ID}`);
     expect(denied.status).toBe(403);
 
     RentalService.findById.mockResolvedValue(null);
-    const missing = await request(app).get('/api/rentals/nope');
+    const missing = await request(app).get(`/api/rentals/${MISSING_ID}`);
     expect(missing.status).toBe(404);
+  });
+
+  test('rejects a non-uuid id with 400 before touching the database', async () => {
+    mockUser = { id: 'u-admin', role: 'admin' };
+
+    const response = await request(app).get('/api/rentals/not-a-uuid');
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toBe('Invalid rental id');
+    expect(RentalService.findById).not.toHaveBeenCalled();
+  });
+
+  test('rejects a non-uuid id on mutating routes too', async () => {
+    mockUser = { id: 'u-renter', role: 'renter' };
+
+    const ended = await request(app).post('/api/rentals/nope/end').send({});
+    expect(ended.status).toBe(400);
+
+    const events = await request(app).post('/api/rentals/123/cancel').send({});
+    expect(events.status).toBe(400);
+
+    expect(RentalService.endRental).not.toHaveBeenCalled();
   });
 });

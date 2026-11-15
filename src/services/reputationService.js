@@ -6,7 +6,15 @@ class ReputationError extends Error { constructor(m, code='reputation_error', st
 class ReputationUnavailable extends ReputationError { constructor() { super('Reputation features are not available on this deployment yet (migration 017 not applied).', 'reputation_unavailable', 503); this.name='ReputationUnavailable'; } }
 
 const client = () => getSupabaseClient(true);
-const failOpen = (e) => { throw isMissingSchema(e) ? new ReputationUnavailable() : e; };
+const failOpen = (e) => {
+  if (isMissingSchema(e)) throw new ReputationUnavailable();
+  // One review per rental per direction (unique index). A second attempt is a
+  // client mistake, not a server fault — answer 409, never 500.
+  if (e && e.code === '23505') {
+    throw new ReputationError('You already reviewed this rental', 'already_reviewed', 409);
+  }
+  throw e;
+};
 const camel = (row) => { if (!row) return row; const o={}; for (const [k,v] of Object.entries(row)) o[k.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]=v; return o; };
 
 const createReview = async ({ rentalId, reviewerId, revieweeId, direction, rating, title, body }) => {

@@ -108,14 +108,27 @@ const latestHeartbeat = async (rentalId) => {
   try { const { data, error } = await client().from('session_heartbeats').select('*').eq('rental_id', rentalId).order('recorded_at',{ascending:false}).limit(1).maybeSingle();
     if (error) { p5FailOpen(error); return null; } return data ? p5Camel(data) : null; } catch (e) { p5FailOpen(e); }
 };
+const SESSION_EVENT_TYPES = new Set(['started','stopped','auto_stopped','idle_warning','key_issued','key_revoked','disk_wiped','error']);
+
 const recordEvent = async (rentalId, eventType, payload = {}) => {
+  // The column has a CHECK constraint; validating here turns a database 500
+  // into the 400 the caller can act on.
+  if (!SESSION_EVENT_TYPES.has(String(eventType))) {
+    throw new SessionError('Unknown session event type', 'invalid_event_type', 400);
+  }
   try { const { data, error } = await client().from('session_events').insert({ rental_id: rentalId, event_type: eventType, payload }).select().single();
     if (error) { p5FailOpen(error); return null; } return p5Camel(data); } catch (e) { p5FailOpen(e); }
 };
 const issueSshKey = async (rentalId, publicKey, expiresAt) => {
+  const key = typeof publicKey === 'string' ? publicKey.trim() : '';
+  // OpenSSH keys only: a missing/garbage key would otherwise hit a CHECK
+  // constraint and surface as a 500.
+  if (key.length < 20 || key.length > 4096 || !/^(ssh-|ecdsa-|sk-)/.test(key)) {
+    throw new SessionError('A valid OpenSSH public key is required', 'invalid_public_key', 400);
+  }
   const crypto = require('crypto');
-  const fingerprint = crypto.createHash('sha256').update(publicKey).digest('hex').slice(0,32);
-  try { const { data, error } = await client().from('session_ssh_keys').insert({ rental_id: rentalId, public_key: publicKey, fingerprint, expires_at: expiresAt || new Date(Date.now()+24*60*60*1000).toISOString() }).select().single();
+  const fingerprint = crypto.createHash('sha256').update(key).digest('hex').slice(0,32);
+  try { const { data, error } = await client().from('session_ssh_keys').insert({ rental_id: rentalId, public_key: key, fingerprint, expires_at: expiresAt || new Date(Date.now()+24*60*60*1000).toISOString() }).select().single();
     if (error) { p5FailOpen(error); return null; } return p5Camel(data); } catch (e) { p5FailOpen(e); }
 };
 const revokeSshKeys = async (rentalId, reason = 'session_ended') => {

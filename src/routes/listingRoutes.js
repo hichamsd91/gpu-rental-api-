@@ -74,10 +74,33 @@ router.get('/:id', async (req, res) => {
 // @access  Private/Provider
 router.post('/', auth, providerAuth, async (req, res) => {
   try {
-    const listing = await GpuListingService.create(req.body, req.user.id);
+    // A listing always belongs to a registered device: the column is NOT NULL.
+    // Validate before the insert so the caller gets a 400 with a reason instead
+    // of a generic 500 from the database.
+    const body = req.body || {};
+    if (!isUuid(body.deviceId)) {
+      return res.status(400).json({ message: 'deviceId is required and must be a valid device id' });
+    }
+    if (body.gpuId !== undefined && body.gpuId !== null && body.gpuId !== '' && !isUuid(body.gpuId)) {
+      return res.status(400).json({ message: 'gpuId must be a valid GPU id' });
+    }
+    // Number(null) and Number('') are 0, so test the raw value first: a listing
+    // must carry an explicit price, even when that price is zero.
+    const rawPrice = body.pricePerHour;
+    const price = Number(rawPrice);
+    if (rawPrice === undefined || rawPrice === null || rawPrice === ''
+      || !Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ message: 'pricePerHour must be a non-negative number' });
+    }
+
+    const listing = await GpuListingService.create(body, req.user.id);
     res.status(201).json({ success: true, listing });
   } catch (error) {
     console.error('Create listing error:', error);
+    // Constraint violations are bad input, not a server fault.
+    if (['23502', '23514', '22P02'].includes(error && error.code)) {
+      return res.status(400).json({ message: 'Invalid listing data' });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });

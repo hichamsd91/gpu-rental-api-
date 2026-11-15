@@ -5,6 +5,16 @@ const catalog = require('../services/catalogService');
 const featureFlags = require('../services/featureFlagService');
 const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
+const { isUuid } = require('../middleware/validation');
+
+// Every :id route below is a rental uuid. Without this guard "undefined" or any
+// other string reached PostgREST and surfaced as a 500.
+router.param('id', (req, res, next, id) => {
+  if (!isUuid(id)) {
+    return res.status(400).json({ message: 'Invalid rental id' });
+  }
+  next();
+});
 
 const idsEqual = (left, right) => left && right && left.toString() === right.toString();
 

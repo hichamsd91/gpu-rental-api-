@@ -126,3 +126,63 @@ describe('DELETE /api/listings/:id (owner scoping)', () => {
     expect(response.body.message).toBe('Server error');
   });
 });
+
+describe('POST /api/listings (input validation)', () => {
+  const deviceId = '44444444-4444-4444-8444-444444444444';
+
+  test('rejects a missing deviceId with 400 instead of a 500', async () => {
+    const response = await request(app).post('/api/listings').send({ pricePerHour: 2 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toMatch(/deviceId/);
+    expect(GpuListingService.create).not.toHaveBeenCalled();
+  });
+
+  test('rejects a malformed gpuId with 400', async () => {
+    const response = await request(app)
+      .post('/api/listings')
+      .send({ deviceId, gpuId: 'not-a-uuid', pricePerHour: 2 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toMatch(/gpuId/);
+    expect(GpuListingService.create).not.toHaveBeenCalled();
+  });
+
+  test.each([[undefined], [-1], ['abc'], [null]])(
+    'rejects an invalid pricePerHour (%p) with 400',
+    async (pricePerHour) => {
+      const response = await request(app)
+        .post('/api/listings')
+        .send({ deviceId, pricePerHour });
+
+      expect(response.status).toBe(400);
+      expect(response.body.message).toMatch(/pricePerHour/);
+      expect(GpuListingService.create).not.toHaveBeenCalled();
+    }
+  );
+
+  test('maps a database not-null violation to 400', async () => {
+    const error = new Error('null value in column "title"');
+    error.code = '23502';
+    GpuListingService.create.mockRejectedValue(error);
+
+    const response = await request(app)
+      .post('/api/listings')
+      .send({ deviceId, pricePerHour: 2 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.message).toBe('Invalid listing data');
+  });
+
+  test('creates the listing for the authenticated provider', async () => {
+    GpuListingService.create.mockResolvedValue({ id: ID, deviceId, pricePerHour: 2 });
+
+    const response = await request(app)
+      .post('/api/listings')
+      .send({ deviceId, pricePerHour: 2 });
+
+    expect(response.status).toBe(201);
+    expect(response.body.success).toBe(true);
+    expect(GpuListingService.create).toHaveBeenCalledWith({ deviceId, pricePerHour: 2 }, 'provider-1');
+  });
+});
