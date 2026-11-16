@@ -9,10 +9,35 @@ const express = require('express');
 const router = express.Router();
 const money = require('../services/moneyService');
 const stripe = require('../services/stripeService');
+const orders = require('../services/orderService');
+const { RentalService } = require('../services/supabaseService');
 const { auth, providerAuth, renterAuth } = require('../middleware/auth');
 const { isUuid } = require('../middleware/validation');
+const { isPaymentsEnabled } = require('../config/env');
 
 const stripeOff = (res) => res.status(503).json({ success: false, code: 'stripe_unavailable', message: 'Stripe is not configured on this deployment.' });
+
+// Escrow and payouts are driven by the rental lifecycle (fund at start, settle
+// at end, one weekly batch). A client-triggered version of those steps would
+// bypass every rule we built (minimum, hold, dispute freeze, cap, refund cap),
+// so the routes answer honestly instead of half-working.
+const automatic = (res, what) => res.status(410).json({
+  success: false,
+  code: 'handled_automatically',
+  message: `${what} is handled automatically by the platform and cannot be triggered by a client.`
+});
+
+// A rental is only visible to its two parties (and admins).
+const loadRentalForCaller = async (req, res) => {
+  const rental = await RentalService.findById(req.params.rentalId);
+  if (!rental) { res.status(404).json({ success: false, code: 'not_found', message: 'Rental not found' }); return null; }
+  const isParty = rental.renterId === req.user.id || rental.providerId === req.user.id;
+  if (!isParty && req.user.role !== 'admin') {
+    res.status(403).json({ success: false, code: 'forbidden', message: 'You are not part of this rental' });
+    return null;
+  }
+  return rental;
+};
 
 const handleError = (error, res) => {
   if (error instanceof money.MoneyUnavailable) {
@@ -58,14 +83,31 @@ router.post('/stripe-account/refresh', auth, providerAuth, async (req, res) => {
 });
 
 // ─── Payment intent for an order (renter) ─────────────────────────────────────
+// The amount is ALWAYS the server-computed order total; a client-supplied
+// amount is only accepted when it matches, otherwise 409. Otherwise a renter
+// could pay $0.01 for a $500 order and still get the escrow released.
 router.post('/payment-intents', auth, renterAuth, async (req, res) => {
   try {
+    if (!isPaymentsEnabled()) return res.status(503).json({ success: false, code: 'PAYMENTS_DISABLED', message: 'Payments are currently disabled on the platform.' });
     const { orderId, amount, currency = 'USD', idempotencyKey } = req.body || {};
     if (!orderId || !isUuid(orderId)) return res.status(400).json({ success: false, code: 'invalid_order_id', message: 'orderId is required' });
-    const amountMinor = Math.round(Number(amount) * 100);
-    if (!Number.isFinite(amountMinor) || amountMinor <= 0) return res.status(400).json({ success: false, code: 'invalid_amount', message: 'amount must be positive' });
+
+    const order = await orders.getOrder(orderId, req.user.id); // throws if not the renter's order
+    const expectedMinor = Math.round(Number(order.total) * 100);
+    if (!Number.isFinite(expectedMinor) || expectedMinor <= 0) {
+      return res.status(409).json({ success: false, code: 'order_not_payable', message: 'This order has no payable total' });
+    }
+    const claimedMinor = amount === undefined || amount === null ? expectedMinor : Math.round(Number(amount) * 100);
+    if (!Number.isFinite(claimedMinor) || claimedMinor !== expectedMinor) {
+      return res.status(409).json({
+        success: false, code: 'amount_mismatch',
+        message: 'The amount does not match the order total',
+        expected: expectedMinor / 100
+      });
+    }
+
     const pi = await money.createPaymentIntentForOrder({
-      userId: req.user.id, orderId, amountMinor, currency, idempotencyKey: idempotencyKey || req.get('Idempotency-Key')
+      userId: req.user.id, orderId, amountMinor: expectedMinor, currency, idempotencyKey: idempotencyKey || req.get('Idempotency-Key')
     });
     res.status(201).json({ success: true, paymentIntent: pi });
   } catch (error) { handleError(error, res); }
@@ -75,6 +117,9 @@ router.get('/payment-intents/:id', auth, async (req, res) => {
   try {
     const pi = await money.getPaymentIntent(req.params.id);
     if (!pi) return res.status(404).json({ success: false, code: 'not_found', message: 'Payment intent not found' });
+    if (pi.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, code: 'forbidden', message: 'This payment is not yours' });
+    }
     res.json({ success: true, paymentIntent: pi });
   } catch (error) { handleError(error, res); }
 });
@@ -127,26 +172,23 @@ router.post('/webhooks/stripe', async (req, res) => {
 router.get('/escrow/:rentalId', auth, async (req, res) => {
   try {
     if (!isUuid(req.params.rentalId)) return res.status(400).json({ success: false, code: 'invalid_id', message: 'Invalid rental id' });
+    const rental = await loadRentalForCaller(req, res);
+    if (!rental) return;
     const hold = await money.getEscrowHold(req.params.rentalId);
     res.json({ success: true, hold });
   } catch (error) { handleError(error, res); }
 });
 
+// Releasing or refunding escrow is part of settlement (settleRental): it pays
+// the provider the actual cost, refunds the unused time and applies the
+// compensation rules. A manual trigger would skip all of that — and a renter
+// could refund someone else's hold.
 router.post('/escrow/:rentalId/release', auth, providerAuth, async (req, res) => {
-  try {
-    if (!isUuid(req.params.rentalId)) return res.status(400).json({ success: false, code: 'invalid_id', message: 'Invalid rental id' });
-    const result = await money.releaseEscrow(req.params.rentalId, req.user.id);
-    res.json({ success: true, result });
-  } catch (error) { handleError(error, res); }
+  automatic(res, 'Releasing escrow');
 });
 
 router.post('/escrow/:rentalId/refund', auth, renterAuth, async (req, res) => {
-  try {
-    if (!isUuid(req.params.rentalId)) return res.status(400).json({ success: false, code: 'invalid_id', message: 'Invalid rental id' });
-    const amountMinor = req.body?.amount ? Math.round(Number(req.body.amount) * 100) : null;
-    const result = await money.refundEscrow(req.params.rentalId, req.user.id, { amountMinor });
-    res.json({ success: true, result });
-  } catch (error) { handleError(error, res); }
+  automatic(res, 'Refunding escrow');
 });
 
 // ─── Payouts ──────────────────────────────────────────────────────────────────
@@ -157,23 +199,32 @@ router.get('/payouts', auth, providerAuth, async (req, res) => {
   } catch (error) { handleError(error, res); }
 });
 
+// Payouts are batched weekly by the enforcer (minimum, Monday, T+7 hold,
+// dispute freeze, cap). Letting a provider schedule its own amount and delay
+// would bypass every one of those guarantees.
 router.post('/payouts/schedule', auth, providerAuth, async (req, res) => {
-  try {
-    const { amount, currency = 'USD', rentalIds = [], delayDays } = req.body || {};
-    const amountMinor = Math.round(Number(amount) * 100);
-    if (!Number.isFinite(amountMinor) || amountMinor <= 0) return res.status(400).json({ success: false, code: 'invalid_amount', message: 'amount must be positive' });
-    const payout = await money.schedulePayout({ providerId: req.user.id, amountMinor, currency, rentalIds, delayDays });
-    res.status(201).json({ success: true, payout });
-  } catch (error) { handleError(error, res); }
+  automatic(res, 'Scheduling a payout');
 });
 
 // ─── Refunds (renter) ─────────────────────────────────────────────────────────
+// Only the owner of the payment may request a refund, and never more than that
+// payment's remaining amount. With payments off, intake is a clean 503.
 router.post('/refunds', auth, renterAuth, async (req, res) => {
   try {
+    if (!isPaymentsEnabled()) return res.status(503).json({ success: false, code: 'PAYMENTS_DISABLED', message: 'Payments are currently disabled on the platform.' });
     const { paymentIntentId, rentalId, amount, currency = 'USD', reason, idempotencyKey } = req.body || {};
     if (!paymentIntentId) return res.status(400).json({ success: false, code: 'invalid_input', message: 'paymentIntentId is required' });
+    const pi = await money.getPaymentIntent(paymentIntentId);
+    if (!pi) return res.status(404).json({ success: false, code: 'not_found', message: 'Payment intent not found' });
+    if (pi.userId !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, code: 'forbidden', message: 'This payment is not yours' });
+    }
+    const paidMinor = Math.round(Number(pi.amountMinor) || 0);
     const amountMinor = Math.round(Number(amount) * 100);
     if (!Number.isFinite(amountMinor) || amountMinor <= 0) return res.status(400).json({ success: false, code: 'invalid_amount', message: 'amount must be positive' });
+    if (paidMinor > 0 && amountMinor > paidMinor) {
+      return res.status(400).json({ success: false, code: 'refund_exceeds_payment', message: `Refund cannot exceed the payment ($${(paidMinor / 100).toFixed(2)})` });
+    }
     const record = await money.createRefundRecord({ paymentIntentId, rentalId, amountMinor, currency, reason, idempotencyKey: idempotencyKey || req.get('Idempotency-Key') });
     // If Stripe configured, issue the refund upstream too.
     if (stripe.isStripeConfigured()) {

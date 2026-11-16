@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { GpuListingService } = require('../services/supabaseService');
+const { GpuListingService, DeviceService } = require('../services/supabaseService');
 const { auth, providerAuth } = require('../middleware/auth');
 const { isUuid } = require('../middleware/validation');
 
@@ -81,6 +81,12 @@ router.post('/', auth, providerAuth, async (req, res) => {
     if (!isUuid(body.deviceId)) {
       return res.status(400).json({ message: 'deviceId is required and must be a valid device id' });
     }
+    // …and it must be YOUR device. Otherwise a provider can list hardware they
+    // do not own (or re-point someone else's listing at their machine).
+    const owned = await DeviceService.findById(body.deviceId).catch(() => null);
+    if (!owned || owned.userId !== req.user.id) {
+      return res.status(403).json({ success: false, code: 'device_not_owned', message: 'That device does not belong to you' });
+    }
     if (body.gpuId !== undefined && body.gpuId !== null && body.gpuId !== '' && !isUuid(body.gpuId)) {
       return res.status(400).json({ message: 'gpuId must be a valid GPU id' });
     }
@@ -110,6 +116,13 @@ router.post('/', auth, providerAuth, async (req, res) => {
 // @access  Private/Provider
 router.put('/:id', auth, providerAuth, async (req, res) => {
   try {
+    // Re-pointing a listing at a device is only allowed for your own hardware.
+    if (req.body && req.body.deviceId !== undefined) {
+      const owned = await DeviceService.findById(req.body.deviceId).catch(() => null);
+      if (!owned || owned.userId !== req.user.id) {
+        return res.status(403).json({ success: false, code: 'device_not_owned', message: 'That device does not belong to you' });
+      }
+    }
     const listing = await GpuListingService.update(req.params.id, req.body, req.user.id);
 
     if (!listing) {

@@ -18,10 +18,13 @@ jest.mock('../services/supabaseService', () => ({
     create: jest.fn(),
     update: jest.fn(),
     delete: jest.fn()
+  },
+  DeviceService: {
+    findById: jest.fn()
   }
 }));
 
-const { GpuListingService } = require('../services/supabaseService');
+const { GpuListingService, DeviceService } = require('../services/supabaseService');
 const listingRoutes = require('./listingRoutes');
 
 const app = express();
@@ -33,6 +36,8 @@ const ID = '11111111-1111-4111-8111-111111111111';
 beforeEach(() => {
   mockUser = { id: 'provider-1', role: 'provider' };
   jest.clearAllMocks();
+  // Every device in these tests belongs to the calling provider.
+  DeviceService.findById.mockImplementation(async (id) => ({ id, userId: 'provider-1' }));
 });
 
 describe('GET /api/listings/:id (public visibility)', () => {
@@ -84,6 +89,18 @@ describe('PUT /api/listings/:id (owner scoping)', () => {
 
     expect(response.status).toBe(404);
     expect(response.body.message).toBe('Listing not found');
+  });
+
+  test('refuses to re-point a listing at another provider\'s device', async () => {
+    DeviceService.findById.mockResolvedValue({ id: '55555555-5555-4555-8555-555555555555', userId: 'someone-else' });
+
+    const response = await request(app)
+      .put(`/api/listings/${ID}`)
+      .send({ deviceId: '55555555-5555-4555-8555-555555555555' });
+
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe('device_not_owned');
+    expect(GpuListingService.update).not.toHaveBeenCalled();
   });
 
   test('returns the updated listing for its owner', async () => {
@@ -172,6 +189,29 @@ describe('POST /api/listings (input validation)', () => {
 
     expect(response.status).toBe(400);
     expect(response.body.message).toBe('Invalid listing data');
+  });
+
+  test('refuses a device that belongs to another provider (403)', async () => {
+    DeviceService.findById.mockResolvedValue({ id: deviceId, userId: 'someone-else' });
+
+    const response = await request(app)
+      .post('/api/listings')
+      .send({ deviceId, pricePerHour: 2 });
+
+    expect(response.status).toBe(403);
+    expect(response.body.code).toBe('device_not_owned');
+    expect(GpuListingService.create).not.toHaveBeenCalled();
+  });
+
+  test('refuses a device id that does not exist (403)', async () => {
+    DeviceService.findById.mockResolvedValue(null);
+
+    const response = await request(app)
+      .post('/api/listings')
+      .send({ deviceId, pricePerHour: 2 });
+
+    expect(response.status).toBe(403);
+    expect(GpuListingService.create).not.toHaveBeenCalled();
   });
 
   test('creates the listing for the authenticated provider', async () => {

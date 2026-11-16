@@ -18,6 +18,10 @@ router.param('id', (req, res, next, id) => {
 
 const idsEqual = (left, right) => left && right && left.toString() === right.toString();
 
+// Service-layer refusals must not look like server faults: answering 500 for
+// "not your rental" hides real incidents and gives the client nothing to show.
+const forbidden = (error) => Boolean(error && (error.status === 403 || /not authorized|not allowed/i.test(String(error.message || ''))));
+
 const canStartRental = (req, rental) => (
   req.user.role === 'admin' ||
   (req.user.role === 'renter' && idsEqual(rental.renterId, req.user.id))
@@ -327,6 +331,9 @@ router.post('/:id/end', auth, async (req, res) => {
     if (isValidationError(error)) {
       return res.status(400).json({ message: error.message });
     }
+    if (forbidden(error)) {
+      return res.status(403).json({ success: false, code: 'forbidden', message: 'You are not allowed to end this rental' });
+    }
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -342,6 +349,9 @@ router.post('/:id/cancel', auth, async (req, res) => {
     console.error('Cancel rental error:', error);
     if (isValidationError(error)) {
       return res.status(400).json({ message: error.message });
+    }
+    if (forbidden(error)) {
+      return res.status(403).json({ success: false, code: 'forbidden', message: 'You are not allowed to cancel this rental' });
     }
     res.status(500).json({ message: 'Server error' });
   }

@@ -120,6 +120,20 @@ app.use(rateLimit({
 }));
 app.use('/api/auth', authLimiter);
 
+// Account creation and password-reset mail are "successful" requests, so the
+// failure-only auth limiter never saw them: unlimited accounts, unlimited reset
+// emails to any address. A separate hourly cap per IP covers both.
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many attempts. Please try again later.' },
+  skip: () => process.env.NODE_ENV === 'test'
+});
+app.use('/api/auth/register', signupLimiter);
+app.use('/api/auth/forgot-password', signupLimiter);
+
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/devices', deviceRoutes);

@@ -21,7 +21,6 @@ const { getSupabaseClient } = require('../config/supabase');
 const MINIMUM_MINOR = Math.max(100, Math.round(Number(process.env.PAYOUT_MINIMUM_USD || 50) * 100));
 const MAXIMUM_MINOR = Math.max(MINIMUM_MINOR, Math.round(Number(process.env.PAYOUT_MAX_USD || 5000) * 100));
 const HOLD_DAYS = Math.max(0, Number(process.env.PAYOUT_HOLD_DAYS || 7));
-const LOOKBACK_DAYS = 90;
 const MIN_BATCH_INTERVAL_MS = 60 * 60 * 1000; // at most one batch an hour
 
 const cents = (value) => Math.round((Number(value) || 0) * 100) || 0;
@@ -80,32 +79,26 @@ async function runBatch({ now = new Date(), dryRun = false, force = false } = {}
   }
 
   const money = require('./moneyService');
-  let rows = [];
   const sb = getSupabaseClient(true);
+
+  // The wallet is the source of truth for what a provider is owed: settlement
+  // credits it, compensation debits it, a completed transfer debits it. Deriving
+  // the amount from the ledger instead let a short-debited payout (or a
+  // compensation) be paid twice.
+  let wallets = [];
   try {
-    const since = new Date(now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
-    const { data, error } = await sb
-      .from('transactions')
-      .select('user_id,type,amount,status')
-      .gte('created_at', since)
-      .in('type', ['provider_earning', 'withdrawal'])
-      .eq('status', 'completed');
+    const { data, error } = await sb.from('wallets').select('user_id,balance');
     if (error) throw error;
-    rows = data || [];
+    wallets = data || [];
   } catch {
-    // No ledger table on this deployment: nothing to pay.
+    // No wallet table on this deployment: nothing to pay.
     return { skipped: 'unavailable', plan: [], created: [] };
   }
 
   const earnings = {};
-  const withdrawals = {};
-  for (const row of rows) {
-    const amount = Math.abs(cents(row.amount));
-    if (row.type === 'provider_earning') {
-      earnings[row.user_id] = (earnings[row.user_id] || 0) + amount;
-    } else {
-      withdrawals[row.user_id] = (withdrawals[row.user_id] || 0) + amount;
-    }
+  for (const wallet of wallets) {
+    const balance = cents(Number(wallet.balance) || 0);
+    if (balance > 0) earnings[wallet.user_id] = balance;
   }
 
   let pending = [];
@@ -139,15 +132,17 @@ async function runBatch({ now = new Date(), dryRun = false, force = false } = {}
       frozen = [...new Set((disputedRentals || []).map((r) => r.provider_id).filter(Boolean))];
     }
   } catch (error) {
-    // A dispute lookup failure must not block everyone else's payout; the
-    // dispute still exists and an admin can hold the transfer manually.
-    if (error.code !== '42P01' && !/does not exist/i.test(error.message || '')) {
-      console.error('[payouts] dispute freeze lookup failed:', error.message);
+    // Fail CLOSED: "we could not check the disputes" must never mean "pay
+    // everyone". The next hourly run will try again.
+    const missingTable = error.code === '42P01' || /does not exist/i.test(error.message || '');
+    if (!missingTable) {
+      console.error('[payouts] dispute freeze lookup failed — batch skipped:', error.message);
+      return { skipped: 'dispute_lookup_failed', plan: [], created: [] };
     }
     frozen = [];
   }
 
-  const plan = selectPayouts({ earnings, withdrawals, scheduled, frozen });
+  const plan = selectPayouts({ earnings, scheduled, frozen });
   if (dryRun) return { plan, created: [], scheduledFor: scheduleDateFor(now).toISOString() };
 
   const scheduledFor = scheduleDateFor(now).toISOString();

@@ -735,33 +735,33 @@ async function fundRentalEscrow(rentalRow) {
 // pays the provider twice or never pays them. A row in ANY status counts as
 // claimed: the claim is written BEFORE the money moves, so a repeated pass can
 // never move it twice. Pending claims are surfaced for manual review.
+//
+// A ledger read failure THROWS on purpose: treating "could not read" as "this
+// rental was never prepaid" would take the legacy path and bill the renter a
+// second time. Settlement is retried by the enforcer, which is free.
 async function listSettlementRows(rentalId) {
   const client = getClient();
   const rows = { escrow: false, escrowAmount: 0, refund: false, earning: false, comp: false, pending: [] };
-  try {
-    const { data, error } = await client
-      .from(SUPABASE_TABLES.transactions)
-      .select('type,status,amount,description')
-      .eq('related_id', rentalId);
-    if (error) throw error;
-    for (const row of data || []) {
-      const description = String(row.description || '');
-      const step = description.startsWith('Session escrow hold') ? 'escrow'
-        : description.startsWith('Unused session time refunded') ? 'refund'
-          : description.startsWith('Rental earnings') ? 'earning'
-            : description.startsWith('Goodwill credit') ? 'comp'
-              : null;
-      if (!step) continue;
-      // A failed/cancelled claim never moved money: it must not block a retry.
-      if (row.status === 'failed' || row.status === 'cancelled') continue;
-      rows[step] = true;
-      if (step === 'escrow') {
-        rows.escrowAmount = Math.max(rows.escrowAmount, Number(row.amount) || 0);
-      }
-      if (row.status === 'pending') rows.pending.push(step);
+  const { data, error } = await client
+    .from(SUPABASE_TABLES.transactions)
+    .select('type,status,amount,description')
+    .eq('related_id', rentalId);
+  if (error) throw error;
+  for (const row of data || []) {
+    const description = String(row.description || '');
+    const step = description.startsWith('Session escrow hold') ? 'escrow'
+      : description.startsWith('Unused session time refunded') ? 'refund'
+        : description.startsWith('Rental earnings') ? 'earning'
+          : description.startsWith('Goodwill credit') ? 'comp'
+            : null;
+    if (!step) continue;
+    // A failed/cancelled claim never moved money: it must not block a retry.
+    if (row.status === 'failed' || row.status === 'cancelled') continue;
+    rows[step] = true;
+    if (step === 'escrow') {
+      rows.escrowAmount = Math.max(rows.escrowAmount, Number(row.amount) || 0);
     }
-  } catch (error) {
-    console.error(`[settlement] ledger lookup failed for rental ${rentalId}:`, error.message);
+    if (row.status === 'pending') rows.pending.push(step);
   }
   return rows;
 }
@@ -1128,9 +1128,18 @@ const RentalService = {
     let minMinutes = 1;
     let planned = 1;
     if (rental.isFree !== true) {
-      pricePerHour = Number(listing?.pricePerHour) || 0;
       minMinutes = Math.max(1, Number(listing?.minRentalMinutes) || 1);
       planned = Math.max(1, Number(rental.plannedDurationMinutes) || minMinutes);
+      // The agreed rate is the one the renter was QUOTED, not the listing's base
+      // price: a purpose-priced listing (e.g. training at a different rate) must
+      // settle at that rate. The quote is frozen on the rental as estimated_cost,
+      // so the rate is reconstructed from it — reading the live listing price
+      // here would pay a provider more than the renter was ever charged.
+      const quoted = Number(rental.estimatedCost) || 0;
+      const plannedHours = planned / 60;
+      pricePerHour = quoted > 0
+        ? quoted / plannedHours
+        : Number(listing?.pricePerHour) || 0;
       if (resuming) {
         // The session's own numbers are already frozen on the rental row.
         finalCost = Math.max(0, Number(rental.actualCost) || 0);
@@ -1144,6 +1153,14 @@ const RentalService = {
     // Was this session prepaid at start? The funding row is written by
     // fundRentalEscrow(); its absence means a legacy (pre-escrow) rental.
     const prepaid = settled.escrowAmount;
+
+    // Never pay out more than was collected: a purpose-priced or edited listing
+    // must not turn settlement into money creation.
+    if (prepaid > 0 && finalCost > prepaid) {
+      console.warn(`[settlement] rental ${id}: computed $${finalCost} > escrow $${prepaid} — capped at the escrow amount`);
+      finalCost = prepaid;
+      billableMinutes = Math.min(billableMinutes, planned);
+    }
 
     // Atomic close: only one caller wins the 'active' -> 'ended' flip.
     // A resume never flips — the row is already closed.
@@ -1540,28 +1557,38 @@ const WalletService = {
     return toCamel(data);
   },
 
+  // Balance changes are compare-and-swap, not read-modify-write: two concurrent
+  // requests (double-tap on Start, a retry racing the first) used to read the
+  // same balance and both write `old - quote`, so one session was never paid
+  // for. Now the UPDATE only applies when the balance is still the value we
+  // read; otherwise we re-read and retry.
   async adjustBalance(userId, amount, isEarning = false) {
     const client = getClient();
-    const wallet = await this.getOrCreate(userId);
-    // NaN guard: a NULL ledger column must never poison the next value
-    // (Postgres NUMERIC happily stores NaN)
-    const delta = Number(amount) || 0;
-    const newBalance = Math.max(0, (Number(wallet.balance) || 0) + delta);
-    const updates = {
-      balance: newBalance,
-      updated_at: new Date().toISOString()
-    };
-    if (isEarning && delta > 0) updates.total_earnings = (Number(wallet.totalEarnings) || 0) + delta;
-    if (!isEarning && delta < 0) updates.total_spent = (Number(wallet.totalSpent) || 0) + Math.abs(delta);
+    const delta = Number(amount) || 0; // NaN guard: a NULL ledger column must never poison the next value
+    const MAX_ATTEMPTS = 5;
 
-    const { data, error } = await client
-      .from(SUPABASE_TABLES.wallets)
-      .update(updates)
-      .eq('user_id', userId)
-      .select()
-      .single();
-    if (error) throw error;
-    return toCamel(data);
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      const wallet = await this.getOrCreate(userId);
+      const current = Number(wallet.balance) || 0;
+      const newBalance = Math.max(0, current + delta);
+      const updates = {
+        balance: newBalance,
+        updated_at: new Date().toISOString()
+      };
+      if (isEarning && delta > 0) updates.total_earnings = (Number(wallet.totalEarnings) || 0) + delta;
+      if (!isEarning && delta < 0) updates.total_spent = (Number(wallet.totalSpent) || 0) + Math.abs(delta);
+
+      const { data, error } = await client
+        .from(SUPABASE_TABLES.wallets)
+        .update(updates)
+        .eq('user_id', userId)
+        .eq('balance', current) // CAS: only if nobody changed it under us
+        .select();
+      if (error) throw error;
+      if (data && data.length > 0) return toCamel(data[0]);
+      // Lost the race: somebody else moved the balance. Re-read and retry.
+    }
+    throw Object.assign(new Error('Wallet is busy, please retry'), { code: 'WALLET_BUSY', status: 409 });
   },
 
   // Payout settlement: move the money out of the provider's spendable wallet

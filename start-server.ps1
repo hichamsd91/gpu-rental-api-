@@ -1,3 +1,8 @@
+# ---------------------------------------------------------------------------
+# MOCK API ONLY — this script answers every login with a demo token and leaves
+# admin routes open. It is a UI helper, never a deployment. Real server:
+#   $env:NODE_ENV='development'; node src/server.js
+# ---------------------------------------------------------------------------
 # GPU Rental Platform - PowerShell HTTP Server
 # يعمل بدون Node.js
 

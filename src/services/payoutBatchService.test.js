@@ -9,27 +9,35 @@ const { getSupabaseClient } = require('../config/supabase');
 const moneyService = require('./moneyService');
 const payouts = require('./payoutBatchService');
 
-const mockTransactions = (rows, error = null, { disputes = [], rentals = [] } = {}) => {
-  const makeQuery = (result) => {
-    const resolved = { data: result, error };
+// The batch reads wallet balances (the on-screen truth) and only then the
+// dispute table, so the mock answers per table.
+const mockTables = (wallets, {
+  walletError = null,
+  disputes = [],
+  disputeError = null,
+  rentals = []
+} = {}) => {
+  const makeQuery = (result, err = null) => {
+    const resolved = { data: result, error: err };
     const query = {
       select: jest.fn(() => query),
       gte: jest.fn(() => query),
       in: jest.fn(() => query),
       eq: jest.fn(() => Promise.resolve(resolved)),
-      // Awaited directly (e.g. .select().in() with no .eq) must resolve too.
       then: (resolve, reject) => Promise.resolve(resolved).then(resolve, reject)
     };
     return query;
   };
   const from = jest.fn((table) => {
-    if (table === 'disputes') return makeQuery(disputes);
+    if (table === 'disputes') return makeQuery(disputes, disputeError);
     if (table === 'rentals') return makeQuery(rentals);
-    return makeQuery(rows);
+    return makeQuery(wallets, walletError);
   });
   getSupabaseClient.mockReturnValue({ from });
   return from;
 };
+
+const walletsOf = (entries) => entries.map(([user_id, balance]) => ({ user_id, balance }));
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -69,23 +77,13 @@ describe('weekly payout dates', () => {
 
 describe('selectPayouts (pure planner)', () => {
   test('nothing below the minimum is paid', () => {
-    expect(payouts.selectPayouts({ earnings: { a: 4999 }, withdrawals: {}, scheduled: {} })).toEqual([]);
+    expect(payouts.selectPayouts({ earnings: { a: 4999 }, scheduled: {} })).toEqual([]);
   });
 
   test('exactly the minimum is paid in full', () => {
     expect(payouts.selectPayouts({ earnings: { a: 5000 } })).toEqual([
       { providerId: 'a', amountMinor: 5000 }
     ]);
-  });
-
-  test('withdrawals already paid are subtracted', () => {
-    expect(payouts.selectPayouts({ earnings: { a: 12000 }, withdrawals: { a: 5000 } })).toEqual([
-      { providerId: 'a', amountMinor: 7000 }
-    ]);
-  });
-
-  test('subtracting a paid withdrawal can drop a provider below the minimum', () => {
-    expect(payouts.selectPayouts({ earnings: { a: 9000 }, withdrawals: { a: 5000 } })).toEqual([]);
   });
 
   test('money already queued is never queued twice', () => {
@@ -117,26 +115,28 @@ describe('selectPayouts (pure planner)', () => {
 });
 
 describe('runBatch', () => {
-  test('books one payout per provider above the threshold', async () => {
-    mockTransactions([
-      { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' },
-      { user_id: 'provider-1', type: 'withdrawal', amount: 20.0, status: 'completed' },
-      { user_id: 'provider-2', type: 'provider_earning', amount: 10.0, status: 'completed' }
-    ]);
+  test('pays the provider wallet balance above the minimum', async () => {
+    mockTables(walletsOf([['provider-1', 80], ['provider-2', 10]]));
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
 
-    expect(result.plan).toEqual([{ providerId: 'provider-1', amountMinor: 6000 }]);
+    expect(result.plan).toEqual([{ providerId: 'provider-1', amountMinor: 8000 }]);
     expect(moneyService.schedulePayout).toHaveBeenCalledTimes(1);
     expect(moneyService.schedulePayout).toHaveBeenCalledWith(
-      expect.objectContaining({ providerId: 'provider-1', amountMinor: 6000 })
+      expect.objectContaining({ providerId: 'provider-1', amountMinor: 8000 })
     );
   });
 
+  test('a wallet already reduced by a completed transfer is not paid again', async () => {
+    // The old ledger-sum approach paid 120 again; the wallet says 40 is left.
+    mockTables(walletsOf([['provider-1', 40]]));
+    const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
+    expect(result.plan).toEqual([]);
+    expect(moneyService.schedulePayout).not.toHaveBeenCalled();
+  });
+
   test('queued money is subtracted from the next batch', async () => {
-    mockTransactions([
-      { user_id: 'provider-1', type: 'provider_earning', amount: 120.0, status: 'completed' }
-    ]);
+    mockTables(walletsOf([['provider-1', 120]]));
     moneyService.listPendingPayouts.mockResolvedValue([
       { providerId: 'provider-1', amountMinor: 4000, status: 'scheduled' }
     ]);
@@ -147,9 +147,7 @@ describe('runBatch', () => {
   });
 
   test('dry run never schedules anything', async () => {
-    mockTransactions([
-      { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' }
-    ]);
+    mockTables(walletsOf([['provider-1', 80]]));
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), dryRun: true });
 
@@ -157,8 +155,8 @@ describe('runBatch', () => {
     expect(moneyService.schedulePayout).not.toHaveBeenCalled();
   });
 
-  test('a missing ledger table is reported, not thrown', async () => {
-    mockTransactions(null, { code: '42P01', message: 'relation "transactions" does not exist' });
+  test('a missing wallet table is reported, not thrown', async () => {
+    mockTables(null, { walletError: { code: '42P01', message: 'relation "wallets" does not exist' } });
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
 
@@ -167,17 +165,10 @@ describe('runBatch', () => {
   });
 
   test('a provider with an open dispute is held back', async () => {
-    mockTransactions(
-      [
-        { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' },
-        { user_id: 'provider-2', type: 'provider_earning', amount: 90.0, status: 'completed' }
-      ],
-      null,
-      {
-        disputes: [{ rental_id: 'rental-1' }],
-        rentals: [{ id: 'rental-1', provider_id: 'provider-1' }]
-      }
-    );
+    mockTables(walletsOf([['provider-1', 80], ['provider-2', 90]]), {
+      disputes: [{ rental_id: 'rental-1' }],
+      rentals: [{ id: 'rental-1', provider_id: 'provider-1' }]
+    });
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
 
@@ -185,10 +176,19 @@ describe('runBatch', () => {
     expect(moneyService.schedulePayout).toHaveBeenCalledTimes(1);
   });
 
+  test('when the dispute lookup fails the whole batch is skipped (fail closed)', async () => {
+    mockTables(walletsOf([['provider-1', 80]]), {
+      disputeError: { code: '57014', message: 'canceling statement due to statement timeout' }
+    });
+
+    const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
+
+    expect(result.skipped).toBe('dispute_lookup_failed');
+    expect(moneyService.schedulePayout).not.toHaveBeenCalled();
+  });
+
   test('a provider that has not finished Stripe onboarding is not queued', async () => {
-    mockTransactions([
-      { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' }
-    ]);
+    mockTables(walletsOf([['provider-1', 80]]));
     moneyService.getStripeAccount.mockResolvedValue({ stripeAccountId: null, payoutsEnabled: false });
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
@@ -198,10 +198,8 @@ describe('runBatch', () => {
     expect(moneyService.schedulePayout).not.toHaveBeenCalled();
   });
 
-  test('a ledger anomaly above the payout cap is held, not transferred', async () => {
-    mockTransactions([
-      { user_id: 'provider-1', type: 'provider_earning', amount: 90000.0, status: 'completed' }
-    ]);
+  test('a balance above the payout cap is held, not transferred', async () => {
+    mockTables(walletsOf([['provider-1', 90000]]));
 
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
 
@@ -211,7 +209,7 @@ describe('runBatch', () => {
   });
 
   test('the batch throttles itself instead of running on every sweep', async () => {
-    mockTransactions([]);
+    mockTables(walletsOf([]));
     const now = new Date('2026-11-18T10:00:00Z');
 
     const first = await payouts.runBatch({ now });

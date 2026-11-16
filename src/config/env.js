@@ -4,7 +4,12 @@ require('dotenv').config({
   path: path.resolve(__dirname, '../../.env')
 });
 
-const isProduction = (process.env.NODE_ENV || 'development') === 'production';
+// Fail closed: an unset NODE_ENV is treated as production, so a bare
+// `node src/server.js` (Docker, a PaaS, a PM2 file) can never boot with the
+// hardcoded development JWT secret. Development has to opt in explicitly.
+const nodeEnv = (process.env.NODE_ENV || 'production').toLowerCase();
+const isProduction = nodeEnv === 'production';
+const allowDevSecrets = nodeEnv === 'development' || nodeEnv === 'test';
 
 const isPaymentsEnabled = () => (/^(true|on|yes)$/i.test(process.env.PAYMENTS_ENABLED || '') === true);
 
@@ -39,12 +44,12 @@ const validateEnvironment = () => {
   const rateLimitWindowMs = ensureValue('RATE_LIMIT_WINDOW_MS', String(15 * 60 * 1000));
   const rateLimitMaxRequests = ensureValue('RATE_LIMIT_MAX_REQUESTS', '100');
 
-  ensureValue('JWT_SECRET', isProduction ? undefined : 'dev-jwt-secret-change-me', {
-    required: isProduction,
+  ensureValue('JWT_SECRET', allowDevSecrets ? 'dev-jwt-secret-change-me' : undefined, {
+    required: !allowDevSecrets,
     allowEmpty: false
   });
-  ensureValue('JWT_REFRESH_SECRET', isProduction ? undefined : 'dev-refresh-secret-change-me', {
-    required: isProduction,
+  ensureValue('JWT_REFRESH_SECRET', allowDevSecrets ? 'dev-refresh-secret-change-me' : undefined, {
+    required: !allowDevSecrets,
     allowEmpty: false
   });
 
