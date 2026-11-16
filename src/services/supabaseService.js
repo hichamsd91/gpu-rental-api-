@@ -735,13 +735,15 @@ async function fundRentalEscrow(rentalRow) {
   return estimate;
 }
 
-// Ledger truth for one rental: which settlement steps already left a
-// completed row. Settlement is multi-step (refund + provider credit +
-// compensation), so every step must be skippable on retry — otherwise a
-// crash between two steps either pays the provider twice or never pays them.
+// Ledger truth for one rental: which settlement steps already left a row.
+// Settlement is multi-step (refund + provider credit + compensation), so every
+// step must be skippable on retry — otherwise a crash between two steps either
+// pays the provider twice or never pays them. A row in ANY status counts as
+// claimed: the claim is written BEFORE the money moves, so a repeated pass can
+// never move it twice. Pending claims are surfaced for manual review.
 async function listSettlementRows(rentalId) {
   const client = getClient();
-  const rows = { escrow: false, escrowAmount: 0, refund: false, earning: false, comp: false };
+  const rows = { escrow: false, escrowAmount: 0, refund: false, earning: false, comp: false, pending: [] };
   try {
     const { data, error } = await client
       .from(SUPABASE_TABLES.transactions)
@@ -750,19 +752,54 @@ async function listSettlementRows(rentalId) {
     if (error) throw error;
     for (const row of data || []) {
       const description = String(row.description || '');
-      const completed = row.status === 'completed';
-      if (description.startsWith('Session escrow hold') && completed) {
-        rows.escrow = true;
+      const step = description.startsWith('Session escrow hold') ? 'escrow'
+        : description.startsWith('Unused session time refunded') ? 'refund'
+          : description.startsWith('Rental earnings') ? 'earning'
+            : description.startsWith('Goodwill credit') ? 'comp'
+              : null;
+      if (!step) continue;
+      rows[step] = true;
+      if (step === 'escrow') {
         rows.escrowAmount = Math.max(rows.escrowAmount, Number(row.amount) || 0);
       }
-      if (completed && description.startsWith('Unused session time refunded')) rows.refund = true;
-      if (completed && description.startsWith('Rental earnings')) rows.earning = true;
-      if (completed && description.startsWith('Goodwill credit')) rows.comp = true;
+      if (row.status === 'pending') rows.pending.push(step);
     }
   } catch (error) {
     console.error(`[settlement] ledger lookup failed for rental ${rentalId}:`, error.message);
   }
   return rows;
+}
+
+// One settlement per rental per process: the enforcer, the request handler and
+// a manual repair can all arrive at once. Chained promises keep them in order.
+const settlementLocks = new Map();
+function withSettlementLock(key, task) {
+  const previous = settlementLocks.get(key) || Promise.resolve();
+  const run = previous.catch(() => {}).then(task);
+  const tracked = run.catch(() => {});
+  settlementLocks.set(key, tracked);
+  tracked.then(() => {
+    if (settlementLocks.get(key) === tracked) settlementLocks.delete(key);
+  });
+  return run;
+}
+
+// Write the claim row BEFORE the balance moves: if the process dies mid-step
+// the row is still there, so no later pass repeats the transfer.
+async function claimSettlementStep({ rentalId, userId, type, description, amount }) {
+  return TransactionService.create(
+    { type, status: 'pending', amount, relatedId: rentalId, description },
+    userId
+  );
+}
+
+async function completeSettlementStep(claim, userId) {
+  try {
+    await TransactionService.updateStatus(claim.id, 'completed', userId);
+  } catch (error) {
+    // The money moved; the row stays pending and is reported for review.
+    console.error(`[settlement] could not mark ${claim.id} completed:`, error.message);
+  }
 }
 
 const RentalService = {
@@ -1055,10 +1092,9 @@ const RentalService = {
   // manual end racing the enforcer settles exactly once.
   async settleRental(id, endReason = 'renter_ended') {
     // One settlement path for every caller (renter end, provider end,
-    // enforcer expiry, heartbeat loss). Escrow-aware: if the session was
-    // prepaid at start, the unused part is refunded and the provider is paid
-    // the actual amount in full (0% platform commission).
-    return this.settleRentalFunded(id, endReason);
+    // enforcer expiry, heartbeat loss, repair pass). Serialised per rental so
+    // two callers can never move the same money twice.
+    return withSettlementLock(id, () => this.settleRentalFunded(id, endReason));
   },
 
   // Escrow-aware settlement. Every money step is individually guarded, the
@@ -1073,6 +1109,11 @@ const RentalService = {
     // missing money rows (the process died between steps). Resume only when a
     // gap is provable; every step below skips itself when its row exists.
     const settled = await listSettlementRows(id);
+    if (settled.pending.length) {
+      console.warn(
+        `[settlement] rental ${id} has pending claims (${settled.pending.join(', ')}) — they block a repeat transfer and need manual review`
+      );
+    }
     const resuming = rental.status !== 'active';
     if (resuming) {
       const moneyGap = settled.escrow && (!settled.earning || !settled.refund);
@@ -1140,28 +1181,30 @@ const RentalService = {
         // ── Escrow path: money was taken at start ─────────────────────
         const refund = Math.round(Math.max(0, prepaid - finalCost) * 1000) / 1000;
         if (refund > 0 && !settled.refund) {
-          await WalletService.adjustBalance(rental.renterId, refund, false);
-          await TransactionService.create({
+          const claim = await claimSettlementStep({
+            rentalId: id,
+            userId: rental.renterId,
             type: 'refund',
-            status: 'completed',
             amount: refund,
-            relatedId: id,
             description: `Unused session time refunded (${billableMinutes} min billed of ${planned} planned)`
-          }, rental.renterId);
+          });
+          await WalletService.adjustBalance(rental.renterId, refund, false);
+          await completeSettlementStep(claim, rental.renterId);
         }
 
         // 0% platform commission: the provider keeps the whole amount.
         providerOwedAmount = finalCost;
         if (finalCost > 0 && rental.providerId && !settled.earning) {
+          const claim = await claimSettlementStep({
+            rentalId: id,
+            userId: rental.providerId,
+            type: 'provider_earning',
+            amount: finalCost,
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+          });
           await WalletService.adjustBalance(rental.providerId, finalCost, true);
           providerCredited = true;
-          await TransactionService.create({
-            type: 'provider_earning',
-            status: 'completed',
-            amount: finalCost,
-            relatedId: id,
-            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
-          }, rental.providerId);
+          await completeSettlementStep(claim, rental.providerId);
         }
       } else if (finalCost > 0 && !resuming) {
         // ── Legacy path: rental started before escrow shipped ─────────
@@ -1191,17 +1234,18 @@ const RentalService = {
           }, rental.renterId);
         }
 
-        if (charged > 0 && rental.providerId) {
+        if (charged > 0 && rental.providerId && !settled.earning) {
           providerOwedAmount = charged; // 0% commission: provider keeps 100%
+          const claim = await claimSettlementStep({
+            rentalId: id,
+            userId: rental.providerId,
+            type: 'provider_earning',
+            amount: charged,
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+          });
           await WalletService.adjustBalance(rental.providerId, charged, true);
           providerCredited = true;
-          await TransactionService.create({
-            type: 'provider_earning',
-            status: 'completed',
-            amount: charged,
-            relatedId: id,
-            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
-          }, rental.providerId);
+          await completeSettlementStep(claim, rental.providerId);
         }
       }
 
@@ -1224,15 +1268,16 @@ const RentalService = {
         const providerBalance = Math.max(0, Number(providerWallet?.balance) || 0);
         const comp = Math.round(Math.min(due, providerBalance) * 1000) / 1000;
         if (comp > 0) {
+          const claim = await claimSettlementStep({
+            rentalId: id,
+            userId: rental.renterId,
+            type: 'refund',
+            amount: comp,
+            description: `Goodwill credit — provider ended the session early (${endReason})`
+          });
           await WalletService.adjustBalance(rental.providerId, -comp, false);
           await WalletService.adjustBalance(rental.renterId, comp, false);
-          await TransactionService.create({
-            type: 'refund',
-            status: 'completed',
-            amount: comp,
-            relatedId: id,
-            description: `Goodwill credit — provider ended the session early (${endReason})`
-          }, rental.renterId);
+          await completeSettlementStep(claim, rental.renterId);
           await TransactionService.create({
             type: 'refund',
             status: 'completed',
@@ -1312,8 +1357,7 @@ const RentalService = {
     const { data: txns, error: txnError } = await client
       .from(SUPABASE_TABLES.transactions)
       .select('related_id,status,description')
-      .in('related_id', rows.map((r) => r.id))
-      .eq('status', 'completed');
+      .in('related_id', rows.map((r) => r.id));
     if (txnError) throw txnError;
 
     const byRental = new Map();

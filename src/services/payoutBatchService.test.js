@@ -1,28 +1,41 @@
 jest.mock('../config/supabase', () => ({ getSupabaseClient: jest.fn() }));
 jest.mock('./moneyService', () => ({
   listPendingPayouts: jest.fn(),
-  schedulePayout: jest.fn()
+  schedulePayout: jest.fn(),
+  getStripeAccount: jest.fn()
 }));
 
 const { getSupabaseClient } = require('../config/supabase');
 const moneyService = require('./moneyService');
 const payouts = require('./payoutBatchService');
 
-const mockTransactions = (rows, error = null) => {
-  const query = {
-    select: jest.fn(() => query),
-    gte: jest.fn(() => query),
-    in: jest.fn(() => query),
-    eq: jest.fn(() => Promise.resolve({ data: rows, error }))
+const mockTransactions = (rows, error = null, { disputes = [], rentals = [] } = {}) => {
+  const makeQuery = (result) => {
+    const resolved = { data: result, error };
+    const query = {
+      select: jest.fn(() => query),
+      gte: jest.fn(() => query),
+      in: jest.fn(() => query),
+      eq: jest.fn(() => Promise.resolve(resolved)),
+      // Awaited directly (e.g. .select().in() with no .eq) must resolve too.
+      then: (resolve, reject) => Promise.resolve(resolved).then(resolve, reject)
+    };
+    return query;
   };
-  getSupabaseClient.mockReturnValue({ from: jest.fn(() => query) });
-  return query;
+  const from = jest.fn((table) => {
+    if (table === 'disputes') return makeQuery(disputes);
+    if (table === 'rentals') return makeQuery(rentals);
+    return makeQuery(rows);
+  });
+  getSupabaseClient.mockReturnValue({ from });
+  return from;
 };
 
 beforeEach(() => {
   jest.clearAllMocks();
   payouts._resetThrottle();
   moneyService.listPendingPayouts.mockResolvedValue([]);
+  moneyService.getStripeAccount.mockResolvedValue({ stripeAccountId: 'acct_test', payoutsEnabled: true });
   moneyService.schedulePayout.mockImplementation(async ({ providerId, amountMinor, scheduledFor }) => ({
     id: `payout-${providerId}`,
     providerId,
@@ -89,6 +102,18 @@ describe('selectPayouts (pure planner)', () => {
   test('junk amounts never produce a payout', () => {
     expect(payouts.selectPayouts({ earnings: { a: NaN, b: null, c: undefined } })).toEqual([]);
   });
+
+  test('a frozen provider (open dispute) is never paid', () => {
+    const plan = payouts.selectPayouts({
+      earnings: { a: 20000, b: 20000 },
+      frozen: ['a']
+    });
+    expect(plan).toEqual([{ providerId: 'b', amountMinor: 20000 }]);
+  });
+
+  test('a frozen Set is accepted too', () => {
+    expect(payouts.selectPayouts({ earnings: { a: 20000 }, frozen: new Set(['a']) })).toEqual([]);
+  });
 });
 
 describe('runBatch', () => {
@@ -138,6 +163,50 @@ describe('runBatch', () => {
     const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
 
     expect(result.skipped).toBe('unavailable');
+    expect(moneyService.schedulePayout).not.toHaveBeenCalled();
+  });
+
+  test('a provider with an open dispute is held back', async () => {
+    mockTransactions(
+      [
+        { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' },
+        { user_id: 'provider-2', type: 'provider_earning', amount: 90.0, status: 'completed' }
+      ],
+      null,
+      {
+        disputes: [{ rental_id: 'rental-1' }],
+        rentals: [{ id: 'rental-1', provider_id: 'provider-1' }]
+      }
+    );
+
+    const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
+
+    expect(result.plan).toEqual([{ providerId: 'provider-2', amountMinor: 9000 }]);
+    expect(moneyService.schedulePayout).toHaveBeenCalledTimes(1);
+  });
+
+  test('a provider that has not finished Stripe onboarding is not queued', async () => {
+    mockTransactions([
+      { user_id: 'provider-1', type: 'provider_earning', amount: 80.0, status: 'completed' }
+    ]);
+    moneyService.getStripeAccount.mockResolvedValue({ stripeAccountId: null, payoutsEnabled: false });
+
+    const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
+
+    expect(result.plan).toHaveLength(1);
+    expect(result.created).toEqual([]);
+    expect(moneyService.schedulePayout).not.toHaveBeenCalled();
+  });
+
+  test('a ledger anomaly above the payout cap is held, not transferred', async () => {
+    mockTransactions([
+      { user_id: 'provider-1', type: 'provider_earning', amount: 90000.0, status: 'completed' }
+    ]);
+
+    const result = await payouts.runBatch({ now: new Date('2026-11-18T10:00:00Z'), force: true });
+
+    expect(result.plan).toHaveLength(1);
+    expect(result.created).toEqual([]);
     expect(moneyService.schedulePayout).not.toHaveBeenCalled();
   });
 
