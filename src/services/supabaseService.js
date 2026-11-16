@@ -715,22 +715,27 @@ async function fundRentalEscrow(rentalRow) {
     );
   }
 
-  await WalletService.adjustBalance(renterId, -estimate, false);
+  // Claim first, move money second — the same rule the settlement steps use.
+  // If the process dies after the claim, the row stays pending instead of the
+  // debit happening silently; settlement then sees the rental as prepaid and
+  // can never charge the renter a second time for the same session.
+  const claim = await TransactionService.create(
+    {
+      type: 'rental_charge',
+      status: 'pending',
+      amount: estimate,
+      relatedId: rentalId,
+      description: `Session escrow hold (refundable) — ${plannedMinutes} min`
+    },
+    renterId
+  );
   try {
-    await TransactionService.create(
-      {
-        type: 'rental_charge',
-        status: 'completed',
-        amount: estimate,
-        relatedId: rentalId,
-        description: `Session escrow hold (refundable) — ${plannedMinutes} min`
-      },
-      renterId
-    );
-  } catch (txnError) {
-    // Never leave a debit without its audit row.
-    await WalletService.adjustBalance(renterId, estimate, false);
-    throw txnError;
+    await WalletService.adjustBalance(renterId, -estimate, false);
+    await TransactionService.updateStatus(claim.id, 'completed', renterId);
+  } catch (debitError) {
+    // Nothing moved: leave a failed claim so the next attempt is not blocked.
+    try { await TransactionService.updateStatus(claim.id, 'failed', renterId); } catch (_) { /* claim stays pending -> flagged for review */ }
+    throw debitError;
   }
   return estimate;
 }
@@ -758,6 +763,8 @@ async function listSettlementRows(rentalId) {
             : description.startsWith('Goodwill credit') ? 'comp'
               : null;
       if (!step) continue;
+      // A failed/cancelled claim never moved money: it must not block a retry.
+      if (row.status === 'failed' || row.status === 'cancelled') continue;
       rows[step] = true;
       if (step === 'escrow') {
         rows.escrowAmount = Math.max(rows.escrowAmount, Number(row.amount) || 0);
