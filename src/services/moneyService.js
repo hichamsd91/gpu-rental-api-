@@ -146,12 +146,13 @@ const getEscrowHold = async (rentalId) => {
   } catch (e) { failOpen(e); }
 };
 
-const releaseEscrow = async (rentalId, providerId, { commissionBps = 500, group = null } = {}) => {
+const releaseEscrow = async (rentalId, providerId, { group = null } = {}) => {
   const g = group || crypto.randomUUID();
   try {
     const { data, error } = await client().rpc('release_escrow', {
       p_rental_id: rentalId, p_provider_id: providerId,
-      p_commission_bps: commissionBps, p_group: g
+      // Owner decision: 0% commission. Never read this from the request body.
+      p_commission_bps: 0, p_group: g
     });
     if (error) { failOpen(error); return { ok: false, code: 'rpc_error', message: error.message }; }
     return data;
@@ -171,11 +172,13 @@ const refundEscrow = async (rentalId, renterId, { amountMinor = null, group = nu
 };
 
 // ─── Payouts (T+7) ───────────────────────────────────────────────────────────
-const schedulePayout = async ({ providerId, amountMinor, currency = 'USD', rentalIds = [], delayDays = 7 }) => {
-  const scheduledFor = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000).toISOString();
+const schedulePayout = async ({ providerId, amountMinor, currency = 'USD', rentalIds = [], delayDays = 7, scheduledFor = null }) => {
+  const when = scheduledFor
+    ? new Date(scheduledFor).toISOString()
+    : new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000).toISOString();
   const payload = {
     provider_id: providerId, amount_minor: amountMinor, currency,
-    status: 'scheduled', scheduled_for: scheduledFor, rental_ids: rentalIds
+    status: 'scheduled', scheduled_for: when, rental_ids: rentalIds
   };
   try {
     const { data, error } = await client().from(TABLES.payouts).insert(payload).select().single();
@@ -196,6 +199,16 @@ const duePayouts = async () => {
   try {
     const now = new Date().toISOString();
     const { data, error } = await client().from(TABLES.payouts).select('*').eq('status', 'scheduled').lte('scheduled_for', now);
+    if (error) { failOpen(error); return []; }
+    return (data || []).map(camel);
+  } catch (e) { failOpen(e); return []; }
+};
+
+// Money that is already queued (not yet transferred). The weekly batch
+// subtracts this so the same earnings are never scheduled twice.
+const listPendingPayouts = async () => {
+  try {
+    const { data, error } = await client().from(TABLES.payouts).select('*').in('status', ['scheduled', 'processing']);
     if (error) { failOpen(error); return []; }
     return (data || []).map(camel);
   } catch (e) { failOpen(e); return []; }
@@ -274,7 +287,7 @@ module.exports = {
   getStripeAccount, upsertStripeAccount, ensureConnectAccount, refreshConnectAccount,
   recordPaymentIntent, getPaymentIntent, updatePaymentIntentStatus, createPaymentIntentForOrder,
   createEscrowHold, getEscrowHold, releaseEscrow, refundEscrow,
-  schedulePayout, listPayouts, duePayouts, markPayoutPaid, markPayoutFailed,
+  schedulePayout, listPayouts, listPendingPayouts, duePayouts, markPayoutPaid, markPayoutFailed,
   createRefundRecord, updateRefundStatus, createInvoice, listInvoices,
   TABLES
 };

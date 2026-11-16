@@ -1,7 +1,7 @@
 // ============================================
 // Rental enforcer — auto-settlement job
 // ============================================
-const { RentalService, healStuckListings } = require('../services/supabaseService');
+const { RentalService, healStuckListings, WalletService } = require('../services/supabaseService');
 
 const INTERVAL_MS = Math.max(10, Number(process.env.RENTAL_ENFORCER_INTERVAL_SEC) || 60) * 1000;
 const PENDING_EXPIRY_MS = 2 * 60 * 60 * 1000;
@@ -29,6 +29,22 @@ async function sweep() {
     try { await healStuckListings(); }
     catch (err) { console.error('[enforcer] healStuckListings failed:', err.message); }
 
+    // Settlement repair: a session that closed but lost a money step to a
+    // crash is re-settled (each step is idempotent) instead of staying unpaid.
+    try {
+      const gaps = await RentalService.findSettlementGaps(25);
+      for (const rental of gaps) {
+        try {
+          await RentalService.settleRental(rental.id, rental.endReason || 'resume');
+          console.log(`[enforcer] repaired settlement for rental ${rental.id}`);
+        } catch (err) {
+          console.error(`[enforcer] settlement repair failed for ${rental.id}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.error('[enforcer] settlement gap scan failed:', err.message);
+    }
+
     try {
       const orderService = require('../services/orderService');
       const swept = await orderService.expireStale(200);
@@ -39,6 +55,19 @@ async function sweep() {
 
     try {
       const moneyService = require('../services/moneyService');
+      const payoutBatch = require('../services/payoutBatchService');
+
+      // 1) Queue this week's payouts (weekly batches, $50 minimum).
+      try {
+        const batch = await payoutBatch.runBatch();
+        if (batch.created && batch.created.length) {
+          console.log(`[enforcer] queued ${batch.created.length} payout(s) for ${batch.scheduledFor}`);
+        }
+      } catch (err) {
+        if (err.code !== 'money_unavailable') console.error('[enforcer] payout batch failed:', err.message);
+      }
+
+      // 2) Transfer whatever is due today.
       const payouts = await moneyService.duePayouts();
       for (const p of payouts) {
         try {
@@ -51,6 +80,13 @@ async function sweep() {
                 destinationAccountId: acct.stripeAccountId, transferGroup: `payout:${p.id}`
               });
               await moneyService.markPayoutPaid(p.id, { transferId: transfer.id });
+              // Take the money out of the spendable wallet, otherwise the
+              // next batch would pay the same earnings again.
+              try {
+                await WalletService.debitForPayout(p.providerId, Number(p.amountMinor) / 100, p.id);
+              } catch (debitError) {
+                console.error(`[enforcer] payout ${p.id} sent but wallet debit failed:`, debitError.message);
+              }
               console.log(`[enforcer] paid out ${p.id}`);
             }
           }

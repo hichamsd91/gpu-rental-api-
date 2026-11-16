@@ -735,6 +735,36 @@ async function fundRentalEscrow(rentalRow) {
   return estimate;
 }
 
+// Ledger truth for one rental: which settlement steps already left a
+// completed row. Settlement is multi-step (refund + provider credit +
+// compensation), so every step must be skippable on retry — otherwise a
+// crash between two steps either pays the provider twice or never pays them.
+async function listSettlementRows(rentalId) {
+  const client = getClient();
+  const rows = { escrow: false, escrowAmount: 0, refund: false, earning: false, comp: false };
+  try {
+    const { data, error } = await client
+      .from(SUPABASE_TABLES.transactions)
+      .select('type,status,amount,description')
+      .eq('related_id', rentalId);
+    if (error) throw error;
+    for (const row of data || []) {
+      const description = String(row.description || '');
+      const completed = row.status === 'completed';
+      if (description.startsWith('Session escrow hold') && completed) {
+        rows.escrow = true;
+        rows.escrowAmount = Math.max(rows.escrowAmount, Number(row.amount) || 0);
+      }
+      if (completed && description.startsWith('Unused session time refunded')) rows.refund = true;
+      if (completed && description.startsWith('Rental earnings')) rows.earning = true;
+      if (completed && description.startsWith('Goodwill credit')) rows.comp = true;
+    }
+  } catch (error) {
+    console.error(`[settlement] ledger lookup failed for rental ${rentalId}:`, error.message);
+  }
+  return rows;
+}
+
 const RentalService = {
   async findAll(userId, userRole, filters = {}, options = {}) {
     const client = getClient();
@@ -1037,9 +1067,19 @@ const RentalService = {
   async settleRentalFunded(id, endReason = 'renter_ended') {
     const client = getClient();
     const rental = await this.findById(id);
-    if (!rental || rental.status !== 'active') return rental;
+    if (!rental) return rental;
 
-    const endTime = new Date();
+    // Crash recovery: a rental that already flipped to 'ended' can still be
+    // missing money rows (the process died between steps). Resume only when a
+    // gap is provable; every step below skips itself when its row exists.
+    const settled = await listSettlementRows(id);
+    const resuming = rental.status !== 'active';
+    if (resuming) {
+      const moneyGap = settled.escrow && (!settled.earning || !settled.refund);
+      if (!moneyGap) return rental;
+    }
+
+    const endTime = resuming && rental.endTime ? new Date(rental.endTime) : new Date();
     const startTime = new Date(rental.startTime);
     const elapsedMinutes = Math.max(1, Math.ceil((endTime - startTime) / (1000 * 60)));
 
@@ -1054,45 +1094,40 @@ const RentalService = {
       pricePerHour = Number(listing?.pricePerHour) || 0;
       minMinutes = Math.max(1, Number(listing?.minRentalMinutes) || 1);
       planned = Math.max(1, Number(rental.plannedDurationMinutes) || minMinutes);
-      billableMinutes = Math.min(Math.max(elapsedMinutes, minMinutes), planned);
-      finalCost = Math.round((billableMinutes / 60) * pricePerHour * 1000) / 1000;
+      if (resuming) {
+        // The session's own numbers are already frozen on the rental row.
+        finalCost = Math.max(0, Number(rental.actualCost) || 0);
+        billableMinutes = Math.max(1, Number(rental.actualDurationMinutes) || minMinutes);
+      } else {
+        billableMinutes = Math.min(Math.max(elapsedMinutes, minMinutes), planned);
+        finalCost = Math.round((billableMinutes / 60) * pricePerHour * 1000) / 1000;
+      }
     }
 
     // Was this session prepaid at start? The funding row is written by
     // fundRentalEscrow(); its absence means a legacy (pre-escrow) rental.
-    let prepaid = 0;
-    try {
-      const { data: funding } = await client
-        .from(SUPABASE_TABLES.transactions)
-        .select('amount')
-        .eq('related_id', id)
-        .eq('user_id', rental.renterId)
-        .eq('type', 'rental_charge')
-        .eq('status', 'completed')
-        .like('description', 'Session escrow hold%')
-        .maybeSingle();
-      prepaid = Math.max(0, Number(funding?.amount) || 0);
-    } catch (lookupError) {
-      console.error(`[settlement] escrow lookup failed for rental ${id}:`, lookupError.message);
-    }
+    const prepaid = settled.escrowAmount;
 
-    // Atomic close: only one caller wins the 'active' -> 'ended' flip
-    const { data: flip, error: flipError } = await client
-      .from(SUPABASE_TABLES.rentals)
-      .update({
-        status: 'ended',
-        end_time: endTime.toISOString(),
-        actual_duration_minutes: elapsedMinutes,
-        actual_cost: finalCost,
-        cost_so_far: finalCost,
-        end_reason: endReason,
-        updated_at: endTime.toISOString()
-      })
-      .eq('id', id)
-      .eq('status', 'active')
-      .select('id');
-    if (flipError) throw flipError;
-    if (!flip || flip.length === 0) return this.findById(id); // already settled
+    // Atomic close: only one caller wins the 'active' -> 'ended' flip.
+    // A resume never flips — the row is already closed.
+    if (!resuming) {
+      const { data: flip, error: flipError } = await client
+        .from(SUPABASE_TABLES.rentals)
+        .update({
+          status: 'ended',
+          end_time: endTime.toISOString(),
+          actual_duration_minutes: elapsedMinutes,
+          actual_cost: finalCost,
+          cost_so_far: finalCost,
+          end_reason: endReason,
+          updated_at: endTime.toISOString()
+        })
+        .eq('id', id)
+        .eq('status', 'active')
+        .select('id');
+      if (flipError) throw flipError;
+      if (!flip || flip.length === 0) return this.findById(id); // already settled
+    }
 
     let moneyError = null;
     // Ledger truth-tracker: which side actually moved — so the audit trail
@@ -1104,7 +1139,7 @@ const RentalService = {
       if (prepaid > 0) {
         // ── Escrow path: money was taken at start ─────────────────────
         const refund = Math.round(Math.max(0, prepaid - finalCost) * 1000) / 1000;
-        if (refund > 0) {
+        if (refund > 0 && !settled.refund) {
           await WalletService.adjustBalance(rental.renterId, refund, false);
           await TransactionService.create({
             type: 'refund',
@@ -1117,7 +1152,7 @@ const RentalService = {
 
         // 0% platform commission: the provider keeps the whole amount.
         providerOwedAmount = finalCost;
-        if (finalCost > 0 && rental.providerId) {
+        if (finalCost > 0 && rental.providerId && !settled.earning) {
           await WalletService.adjustBalance(rental.providerId, finalCost, true);
           providerCredited = true;
           await TransactionService.create({
@@ -1128,7 +1163,7 @@ const RentalService = {
             description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
           }, rental.providerId);
         }
-      } else if (finalCost > 0) {
+      } else if (finalCost > 0 && !resuming) {
         // ── Legacy path: rental started before escrow shipped ─────────
         const renterWallet = await WalletService.getOrCreate(rental.renterId);
         const available = Math.max(0, Number(renterWallet.balance) || 0);
@@ -1175,7 +1210,7 @@ const RentalService = {
       // Batch work (training/rendering): 2x the value of the remaining time.
       // Always paid by the provider (never the platform), capped by their
       // balance so a wallet can never go negative.
-      if (String(endReason).startsWith('provider_ended') && rental.providerId && finalCost > 0) {
+      if (String(endReason).startsWith('provider_ended') && rental.providerId && finalCost > 0 && !settled.comp) {
         const remaining = Math.max(0, planned - Math.min(elapsedMinutes, planned));
         const plannedValue = Math.round((planned / 60) * pricePerHour * 1000) / 1000;
         const batch = ['training', 'rendering'].includes(String(rental.purpose || ''));
@@ -1256,6 +1291,45 @@ const RentalService = {
     }
 
     return this.findById(id);
+  },
+
+  // Sessions that closed but whose money rows are incomplete — the repair
+  // pass for a crash between settlement steps. Bounded and recent only.
+  async findSettlementGaps(limit = 25) {
+    const client = getClient();
+    const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const { data: rentals, error } = await client
+      .from(SUPABASE_TABLES.rentals)
+      .select('*')
+      .eq('status', 'ended')
+      .gte('updated_at', since)
+      .order('updated_at', { ascending: true })
+      .limit(limit);
+    if (error) throw error;
+    const rows = rentals || [];
+    if (!rows.length) return [];
+
+    const { data: txns, error: txnError } = await client
+      .from(SUPABASE_TABLES.transactions)
+      .select('related_id,status,description')
+      .in('related_id', rows.map((r) => r.id))
+      .eq('status', 'completed');
+    if (txnError) throw txnError;
+
+    const byRental = new Map();
+    for (const t of txns || []) {
+      const set = byRental.get(t.related_id) || { escrow: false, earning: false, refund: false };
+      const description = String(t.description || '');
+      if (description.startsWith('Session escrow hold')) set.escrow = true;
+      if (description.startsWith('Rental earnings')) set.earning = true;
+      if (description.startsWith('Unused session time refunded')) set.refund = true;
+      byRental.set(t.related_id, set);
+    }
+
+    return rows.map(toCamel).filter((r) => {
+      const set = byRental.get(r.id);
+      return Boolean(set && set.escrow && (!set.earning || !set.refund));
+    });
   },
 
   // Rentals due for auto-settlement (used by the enforcer job).
@@ -1448,6 +1522,33 @@ const WalletService = {
       .single();
     if (error) throw error;
     return toCamel(data);
+  },
+
+  // Payout settlement: move the money out of the provider's spendable wallet
+  // and record it. Without this the same earnings look payable again on the
+  // next batch — the classic double-payout bug.
+  async debitForPayout(providerId, amount, payoutId) {
+    const value = Math.round(Math.max(0, Number(amount) || 0) * 1000) / 1000;
+    if (!(value > 0)) return 0;
+    const wallet = await this.getOrCreate(providerId);
+    const available = Math.max(0, Number(wallet.balance) || 0);
+    const taken = Math.round(Math.min(value, available) * 1000) / 1000;
+    if (!(taken > 0)) return 0;
+    await this.adjustBalance(providerId, -taken, false);
+    try {
+      await TransactionService.create({
+        type: 'withdrawal',
+        status: 'completed',
+        amount: taken,
+        relatedId: payoutId,
+        description: 'Weekly payout transferred to provider'
+      }, providerId);
+    } catch (txnError) {
+      // Never leave a debit without its audit row.
+      await this.adjustBalance(providerId, taken, false);
+      throw txnError;
+    }
+    return taken;
   }
 };
 

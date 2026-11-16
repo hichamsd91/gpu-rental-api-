@@ -135,7 +135,7 @@ router.get('/escrow/:rentalId', auth, async (req, res) => {
 router.post('/escrow/:rentalId/release', auth, providerAuth, async (req, res) => {
   try {
     if (!isUuid(req.params.rentalId)) return res.status(400).json({ success: false, code: 'invalid_id', message: 'Invalid rental id' });
-    const result = await money.releaseEscrow(req.params.rentalId, req.user.id, { commissionBps: req.body?.commissionBps });
+    const result = await money.releaseEscrow(req.params.rentalId, req.user.id);
     res.json({ success: true, result });
   } catch (error) { handleError(error, res); }
 });

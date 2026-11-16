@@ -142,6 +142,27 @@ router.get('/rentals', adminAuth, async (req, res) => {
   }
 });
 
+// @desc    Repair a settlement that lost a money step (crash between steps)
+// @route   POST /api/admin/rentals/:id/resettle
+// @access  Private/Admin
+// Safe by construction: each settlement step skips itself when its ledger row
+// already exists, so a fully settled rental is returned untouched.
+router.post('/rentals/:id/resettle', adminAuth, async (req, res) => {
+  try {
+    const { isUuid } = require('../middleware/validation');
+    if (!isUuid(req.params.id)) {
+      return res.status(400).json({ success: false, code: 'invalid_id', message: 'Invalid rental id' });
+    }
+    const { RentalService } = require('../services/supabaseService');
+    const rental = await RentalService.settleRental(req.params.id, 'admin_resettle');
+    if (!rental) return res.status(404).json({ success: false, code: 'not_found', message: 'Rental not found' });
+    res.json({ success: true, rental });
+  } catch (error) {
+    console.error('Resettle rental error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // @desc    Get platform stats
 // @route   GET /api/admin/stats
 // @access  Private/Admin
