@@ -92,7 +92,7 @@ async function runBatch({ now = new Date(), dryRun = false, force = false } = {}
       .eq('status', 'completed');
     if (error) throw error;
     rows = data || [];
-  } catch (error) {
+  } catch {
     // No ledger table on this deployment: nothing to pay.
     return { skipped: 'unavailable', plan: [], created: [] };
   }
@@ -111,7 +111,7 @@ async function runBatch({ now = new Date(), dryRun = false, force = false } = {}
   let pending = [];
   try {
     pending = await money.listPendingPayouts();
-  } catch (error) {
+  } catch {
     pending = [];
   }
   const scheduled = {};
@@ -165,7 +165,7 @@ async function runBatch({ now = new Date(), dryRun = false, force = false } = {}
     let account = null;
     try {
       account = await money.getStripeAccount(item.providerId);
-    } catch (error) {
+    } catch {
       account = null;
     }
     if (!account || !account.stripeAccountId || !account.payoutsEnabled) continue;

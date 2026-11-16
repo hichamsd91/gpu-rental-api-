@@ -68,6 +68,7 @@ const adminAuth = async (req, res, next) => {
       next();
     });
   } catch (error) {
+    console.error('[auth] token verification failed:', error.message);
     res.status(401).json({ message: 'Authorization failed' });
   }
 };
@@ -81,6 +82,7 @@ const providerAuth = async (req, res, next) => {
       next();
     });
   } catch (error) {
+    console.error('[auth] token verification failed:', error.message);
     res.status(401).json({ message: 'Authorization failed' });
   }
 };
@@ -94,6 +96,7 @@ const renterAuth = async (req, res, next) => {
       next();
     });
   } catch (error) {
+    console.error('[auth] token verification failed:', error.message);
     res.status(401).json({ message: 'Authorization failed' });
   }
 };

@@ -46,17 +46,6 @@ const toSnake = (obj) => {
   return result;
 };
 
-// Helper: Build filter object for Supabase queries
-const buildFilters = (query) => {
-  const filters = {};
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== null && value !== '') {
-      filters[key] = value;
-    }
-  }
-  return filters;
-};
-
 // Helper: Pick only explicitly allowed fields (mass-assignment protection)
 const pickAllowed = (obj, allowed) => {
   const out = {};
@@ -734,7 +723,7 @@ async function fundRentalEscrow(rentalRow) {
     await TransactionService.updateStatus(claim.id, 'completed', renterId);
   } catch (debitError) {
     // Nothing moved: leave a failed claim so the next attempt is not blocked.
-    try { await TransactionService.updateStatus(claim.id, 'failed', renterId); } catch (_) { /* claim stays pending -> flagged for review */ }
+    try { await TransactionService.updateStatus(claim.id, 'failed', renterId); } catch { /* claim stays pending -> flagged for review */ }
     throw debitError;
   }
   return estimate;

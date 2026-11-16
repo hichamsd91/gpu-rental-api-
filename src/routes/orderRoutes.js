@@ -109,7 +109,6 @@ router.post('/:id/cancel', auth, renterAuth, idempotent('orders.cancel', async (
 // Router-scoped error mapping: stable `code` for the app to localize, and a
 // 503 (not 500) while migration 013 is pending.
 // eslint-disable-next-line no-unused-vars
-// eslint-disable-next-line no-unused-vars
 router.use((error, req, res, next) => {
   if (error instanceof orders.OrdersUnavailable || error instanceof idempotency.IdempotencyError) {
     return res.status(error.status || 409).json({

@@ -39,7 +39,7 @@ const requireClient = () => {
   return client;
 };
 
-const toStripeAmount = (minor, currency) => {
+const toStripeAmount = (minor) => {
   // Stripe expects the smallest currency unit; for zero-decimal currencies the
   // minor unit IS the major unit, so pass through.
   return Math.round(Number(minor));
@@ -48,7 +48,7 @@ const toStripeAmount = (minor, currency) => {
 const createPaymentIntent = async ({ amountMinor, currency = 'USD', userId, orderId = null, rentalId = null, idempotencyKey = null, metadata = {} }) => {
   const client = requireClient();
   const params = {
-    amount: toStripeAmount(amountMinor, currency),
+    amount: toStripeAmount(amountMinor),
     currency: String(currency).toLowerCase(),
     automatic_payment_methods: { enabled: true },
     metadata: { userId: String(userId), orderId: orderId || '', rentalId: rentalId || '', ...metadata }
@@ -70,7 +70,7 @@ const cancelPaymentIntent = async (id) => {
 const createRefund = async ({ paymentIntentId, amountMinor = null, reason = null, idempotencyKey = null }) => {
   const client = requireClient();
   const params = { payment_intent: paymentIntentId };
-  if (amountMinor != null) params.amount = toStripeAmount(amountMinor, 'USD');
+  if (amountMinor != null) params.amount = toStripeAmount(amountMinor);
   if (reason) params.reason = reason;
   const options = idempotencyKey ? { idempotencyKey } : undefined;
   return client.refunds.create(params, options);

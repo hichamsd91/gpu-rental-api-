@@ -1,4 +1,4 @@
-const { body, validationResult } = require('express-validator');
+const { validationResult } = require('express-validator');
 
 const validateRequest = (validations = []) => {
   const list = Array.isArray(validations) ? validations : [validations].filter(Boolean);
