@@ -43,3 +43,6 @@ coverage/
 *.pem
 .vercel
 .netlify
+
+# E2E fixtures (scripts/e2e) are generated locally
+scripts/e2e/.fixtures.json
