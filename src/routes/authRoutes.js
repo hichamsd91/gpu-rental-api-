@@ -361,6 +361,12 @@ router.post('/reset-password', validateRequest([
     // Invalidate any other outstanding reset links for this user.
     await revokeAllForUser(userId, PURPOSE.RESET_PASSWORD).catch(() => {});
 
+    // …and every session that was opened with the old password: a stolen
+    // refresh token must not outlive the reset that was meant to kill it.
+    await sessions.revokeAllExcept({ userId }).catch((error) => {
+      console.error('Reset password: could not revoke sessions:', error.message || String(error));
+    });
+
     res.json({ success: true, message: 'Password updated. Sign in with your new password.' });
   } catch (error) {
     console.error('Reset password error:', error.message || String(error));
@@ -463,21 +469,59 @@ const issueOAuthCode = (userId) =>
     { expiresIn: '2m' }
   );
 
+// OAuth login CSRF: without a `state` value the callback accepts a code that an
+// attacker started, which logs the victim into the attacker's account. The
+// state is signed, bound to a HttpOnly cookie and checked before the exchange.
+const OAUTH_STATE_PURPOSE = 'oauth_state';
+const OAUTH_STATE_COOKIE = (name) => `oauth_state_${name}`;
+
+const issueOAuthState = () =>
+  jwt.sign(
+    { purpose: OAUTH_STATE_PURPOSE, jti: crypto.randomUUID() },
+    process.env.JWT_SECRET,
+    { expiresIn: '10m' }
+  );
+
+const consumeOAuthState = (req, res, name) => {
+  const cookieName = OAUTH_STATE_COOKIE(name);
+  const expected = (req.cookies && req.cookies[cookieName]) || '';
+  res.clearCookie(cookieName, { path: '/' });
+  const received = typeof req.query.state === 'string' ? req.query.state : '';
+  if (!expected || !received) return false;
+  try {
+    const decoded = jwt.verify(expected, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    if (decoded.purpose !== OAUTH_STATE_PURPOSE) return false;
+  } catch {
+    return false;
+  }
+  const left = Buffer.from(expected);
+  const right = Buffer.from(received);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+};
+
 const registerProviderRoutes = (name, enabled) => {
   router.get(`/${name}`, (req, res, next) => {
     if (!enabled) {
       return res.status(503).json({ message: `${name} sign-in is not configured` });
     }
-    return passport.authenticate(name, { session: false })(req, res, next);
+    const state = issueOAuthState();
+    res.cookie(OAUTH_STATE_COOKIE(name), state, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 10 * 60 * 1000,
+      path: '/'
+    });
+    return passport.authenticate(name, { session: false, state })(req, res, next);
   });
 
   router.get(`/${name}/callback`, (req, res, next) => {
     if (!enabled) {
       return res.status(503).json({ message: `${name} sign-in is not configured` });
     }
+    const fail = (reason) => res.redirect(`${FRONTEND_URL}/#/login?error=${encodeURIComponent(reason)}`);
+    if (!consumeOAuthState(req, res, name)) return fail('oauth_state_mismatch');
     passport.authenticate(name, { session: false }, async (err, result) => {
-      const fail = (reason) => res.redirect(`${FRONTEND_URL}/#/login?error=${encodeURIComponent(reason)}`);
-
       if (err || !result) return fail(err?.code || 'oauth_failed');
       try {
         const { user } = await oauth.linkOrCreate(result.provider, result.profile);

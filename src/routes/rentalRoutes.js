@@ -5,7 +5,7 @@ const catalog = require('../services/catalogService');
 const featureFlags = require('../services/featureFlagService');
 const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
-const { isUuid } = require('../middleware/validation');
+const { isUuid, parsePagedQuery } = require('../middleware/validation');
 
 // Every :id route below is a rental uuid. Without this guard "undefined" or any
 // other string reached PostgREST and surfaced as a 500.
@@ -101,7 +101,8 @@ const isValidationError = error => error && (
 // @access  Private
 router.get('/', auth, async (req, res) => {
   try {
-    const { status, page = 1, limit = 20 } = req.query;
+    const { status } = req.query;
+    const { page, limit } = parsePagedQuery(req.query);
 
     const result = await RentalService.findAll(req.user.id, req.user.role, { status }, { page, limit });
 

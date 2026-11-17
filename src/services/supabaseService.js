@@ -423,8 +423,14 @@ const GpuListingService = {
       if (filters.isPublic !== undefined) q = q.eq('is_public', filters.isPublic);
       if (filters.providerId) q = q.eq('provider_id', filters.providerId);
       if (filters.gpuBrand) q = q.eq('gpu_brand', filters.gpuBrand);
-      if (filters.minVram) q = q.gte('vram_gb', parseInt(filters.minVram));
-      if (filters.maxPrice) q = q.lte('price_per_hour', parseFloat(filters.maxPrice));
+      if (filters.minVram) {
+        const minVram = Number.parseInt(filters.minVram, 10);
+        if (Number.isFinite(minVram)) q = q.gte('vram_gb', minVram); // `?minVram=abc` must not become a 500
+      }
+      if (filters.maxPrice) {
+        const maxPrice = Number.parseFloat(filters.maxPrice);
+        if (Number.isFinite(maxPrice)) q = q.lte('price_per_hour', maxPrice);
+      }
       if (filters.search) {
         // SECURITY: strip PostgREST filter metacharacters (,, (), ', %) and cap length
         const safeSearch = String(filters.search)
@@ -432,7 +438,8 @@ const GpuListingService = {
           .trim()
           .slice(0, 100);
         if (safeSearch) {
-          q = q.or(`gpu_name.ilike.%${safeSearch}%,gpu_brand.ilike.%${safeSearch}%,cpu_model.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%`);
+          // Quoted per PostgREST rules: an unquoted value lets '.', '*' or ':' alter the filter.
+          q = q.or(`gpu_name.ilike."%${safeSearch}%",gpu_brand.ilike."%${safeSearch}%",cpu_model.ilike."%${safeSearch}%",description.ilike."%${safeSearch}%"`);
         }
       }
 
@@ -447,8 +454,8 @@ const GpuListingService = {
       q = q.order(sort.column, { ascending: sort.ascending });
 
       // Pagination
-      const page = parseInt(options.page) || 1;
-      const limit = parseInt(options.limit) || 20;
+      const page = Math.max(parseInt(options.page, 10) || 1, 1);
+      const limit = Math.min(Math.max(parseInt(options.limit, 10) || 20, 1), 200);
       return q.range((page - 1) * limit, page * limit - 1);
     };
 
@@ -483,8 +490,8 @@ const GpuListingService = {
       }
     }
 
-    const page = parseInt(options.page) || 1;
-    const limit = parseInt(options.limit) || 20;
+    const page = Math.max(parseInt(options.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(options.limit, 10) || 20, 1), 200);
     return {
       listings,
       catalogAvailable,
@@ -782,11 +789,40 @@ function withSettlementLock(key, task) {
 
 // Write the claim row BEFORE the balance moves: if the process dies mid-step
 // the row is still there, so no later pass repeats the transfer.
-async function claimSettlementStep({ rentalId, userId, type, description, amount }) {
+//
+// The in-process lock only covers one API instance. The settlement_claims
+// table (primary key rental_id + step) is the cross-process claim: the INSERT
+// is the atomic test-and-set, so two Render instances (or a second worker)
+// racing the same repair cannot both pay. Returns null when someone else owns
+// the step — callers must skip the money move entirely.
+async function claimSettlementStep({ rentalId, userId, type, description, amount, step }) {
+  const client = getClient();
+  if (step) {
+    const { error } = await client
+      .from('settlement_claims')
+      .insert([{ rental_id: rentalId, step, amount: Number.isFinite(Number(amount)) ? Number(amount) : null }]);
+    if (error) {
+      if (error.code === '23505') return null; // already claimed by another process
+      // Deployment without the table (older database): fall back to the row-based
+      // guard instead of failing the settlement.
+      if (error.code !== '42P01' && !/does not exist/i.test(error.message || '')) throw error;
+    }
+  }
   return TransactionService.create(
     { type, status: 'pending', amount, relatedId: rentalId, description },
     userId
   );
+}
+
+// A retryable failure (the wallet lost a CAS race) released its claim: no money
+// moved, so the next pass may take the step again.
+async function releaseSettlementClaim(rentalId, step) {
+  if (!step) return;
+  try {
+    await getClient().from('settlement_claims').delete().eq('rental_id', rentalId).eq('step', step);
+  } catch (error) {
+    console.error(`[settlement] could not release claim ${rentalId}/${step}:`, error.message);
+  }
 }
 
 async function completeSettlementStep(claim, userId) {
@@ -796,6 +832,31 @@ async function completeSettlementStep(claim, userId) {
     // The money moved; the row stays pending and is reported for review.
     console.error(`[settlement] could not mark ${claim.id} completed:`, error.message);
   }
+}
+
+// One money step, at most once across every API instance: claim atomically,
+// then move, then mark the claim completed. Errors that prove nothing moved
+// (the wallet lost a CAS race, the compensation RPC refused) release the claim
+// so the next sweep can retry — everything else stays claimed for review.
+async function settleStep({ rentalId, step, userId, type, description, amount, move }) {
+  const claim = await claimSettlementStep({ rentalId, step, userId, type, description, amount });
+  if (!claim) return false;
+  try {
+    await move();
+  } catch (error) {
+    const retryable = Boolean(error) && (error.code === 'WALLET_BUSY' || error.retryable === true);
+    if (retryable) {
+      await releaseSettlementClaim(rentalId, step);
+      try {
+        await TransactionService.updateStatus(claim.id, 'failed', userId);
+      } catch (statusError) {
+        console.error(`[settlement] could not mark ${claim.id} failed:`, statusError.message);
+      }
+    }
+    throw error;
+  }
+  await completeSettlementStep(claim, userId);
+  return true;
 }
 
 const RentalService = {
@@ -817,8 +878,8 @@ const RentalService = {
     if (filters.status) query = query.eq('status', filters.status);
 
     // Pagination
-    const page = parseInt(options.page) || 1;
-    const limit = parseInt(options.limit) || 20;
+    const page = Math.max(parseInt(options.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(options.limit, 10) || 20, 1), 200);
     query = query.order('start_time', { ascending: false })
       .range((page - 1) * limit, page * limit - 1);
 
@@ -881,65 +942,6 @@ const RentalService = {
         .single());
     }
     if (error) throw error;
-    return toCamel(data);
-  },
-
-  async createFree(rentalData, renterId) {
-    const client = getClient();
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours
-    const record = {
-      ...toSnake(rentalData),
-      id: crypto.randomUUID(),
-      renter_id: renterId,
-      start_time: now.toISOString(),
-      end_time: expiresAt.toISOString(),
-      status: 'active', // Free rentals start immediately as active
-      is_free: true,
-      session_type: 'free_ad_supported',
-      expires_at: expiresAt.toISOString()
-    };
-    const { data, error } = await client
-      .from(SUPABASE_TABLES.rentals)
-      .insert([record])
-      .select()
-      .single();
-    if (error) throw error;
-
-    // Claim the listing for the free session — and verify the claim took
-    // (a silent 0-row update would double-book an already rented GPU)
-    if (rentalData.listingId) {
-      const { data: claimed, error: claimError } = await client
-        .from(SUPABASE_TABLES.gpu_listings)
-        .update({ status: 'rented', updated_at: new Date().toISOString() })
-        .eq('id', rentalData.listingId)
-        .eq('status', 'active')
-        .select('id');
-
-      if (claimError || !claimed || claimed.length === 0) {
-        // Slot taken — cancel the just-created free rental (nothing ran)
-        await client
-          .from(SUPABASE_TABLES.rentals)
-          .update({ status: 'cancelled', end_reason: 'Listing became unavailable', updated_at: new Date().toISOString() })
-          .eq('id', data.id);
-        throw claimError || new Error('Listing is not available (already rented)');
-      }
-    }
-    
-    // Emit signaling event via Supabase realtime for provider notification
-    await client
-      .from(SUPABASE_TABLES.rentals)
-      .update({ signaling_payload: JSON.stringify({
-        type: 'free_session_started',
-        rentalId: data.id,
-        expiresAt: expiresAt.toISOString()
-      }), updated_at: new Date().toISOString() })
-      .eq('id', data.id);
-
-    // Free sessions get the same per-rental access blob when configured — a
-    // rented GPU is accessed the same way whether the session costs $0.
-    await attachAccessPayload(client, data.id, rentalData.listingId);
-
     return toCamel(data);
   },
 
@@ -1187,37 +1189,37 @@ const RentalService = {
     // Ledger truth-tracker: which side actually moved — so the audit trail
     // below can never re-bill money that already left the renter's wallet
     let renterCharged = false;
-    let providerOwedAmount = 0; // 95% of what was collected (after the 5% cut)
+    let providerOwedAmount = 0; // what the provider is owed (0% commission: the whole amount)
     let providerCredited = false;
     try {
       if (prepaid > 0) {
         // ── Escrow path: money was taken at start ─────────────────────
         const refund = Math.round(Math.max(0, prepaid - finalCost) * 1000) / 1000;
         if (refund > 0 && !settled.refund) {
-          const claim = await claimSettlementStep({
+          await settleStep({
             rentalId: id,
+            step: 'refund',
             userId: rental.renterId,
             type: 'refund',
             amount: refund,
-            description: `Unused session time refunded (${billableMinutes} min billed of ${planned} planned)`
+            description: `Unused session time refunded (${billableMinutes} min billed of ${planned} planned)`,
+            move: () => WalletService.adjustBalance(rental.renterId, refund, false)
           });
-          await WalletService.adjustBalance(rental.renterId, refund, false);
-          await completeSettlementStep(claim, rental.renterId);
         }
 
         // 0% platform commission: the provider keeps the whole amount.
         providerOwedAmount = finalCost;
         if (finalCost > 0 && rental.providerId && !settled.earning) {
-          const claim = await claimSettlementStep({
+          await settleStep({
             rentalId: id,
+            step: 'earning',
             userId: rental.providerId,
             type: 'provider_earning',
             amount: finalCost,
-            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`,
+            move: () => WalletService.adjustBalance(rental.providerId, finalCost, true)
           });
-          await WalletService.adjustBalance(rental.providerId, finalCost, true);
           providerCredited = true;
-          await completeSettlementStep(claim, rental.providerId);
         }
       } else if (finalCost > 0 && !resuming) {
         // ── Legacy path: rental started before escrow shipped ─────────
@@ -1249,16 +1251,16 @@ const RentalService = {
 
         if (charged > 0 && rental.providerId && !settled.earning) {
           providerOwedAmount = charged; // 0% commission: provider keeps 100%
-          const claim = await claimSettlementStep({
+          await settleStep({
             rentalId: id,
+            step: 'earning',
             userId: rental.providerId,
             type: 'provider_earning',
             amount: charged,
-            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`
+            description: `Rental earnings (${billableMinutes} min, 0% platform commission)`,
+            move: () => WalletService.adjustBalance(rental.providerId, charged, true)
           });
-          await WalletService.adjustBalance(rental.providerId, charged, true);
           providerCredited = true;
-          await completeSettlementStep(claim, rental.providerId);
         }
       }
 
@@ -1281,23 +1283,35 @@ const RentalService = {
         const providerBalance = Math.max(0, Number(providerWallet?.balance) || 0);
         const comp = Math.round(Math.min(due, providerBalance) * 1000) / 1000;
         if (comp > 0) {
-          const claim = await claimSettlementStep({
+          await settleStep({
             rentalId: id,
+            step: 'comp',
             userId: rental.renterId,
             type: 'refund',
             amount: comp,
-            description: `Goodwill credit — provider ended the session early (${endReason})`
+            description: `Goodwill credit — provider ended the session early (${endReason})`,
+            // Both legs (debit the provider, credit the renter) happen inside one
+            // SQL function: a crash can no longer take the money from the
+            // provider without giving it to the renter.
+            move: async () => {
+              const { data, error } = await client.rpc('apply_compensation', {
+                p_provider_id: rental.providerId,
+                p_renter_id: rental.renterId,
+                p_amount: comp
+              });
+              if (error) throw error;
+              if (!data || data.ok !== true) {
+                throw Object.assign(new Error(`compensation refused: ${data?.code || 'unknown'}`), { retryable: true });
+              }
+              await TransactionService.create({
+                type: 'refund',
+                status: 'completed',
+                amount: -Number(data.taken || comp),
+                relatedId: id,
+                description: `Provider early-end compensation (${endReason})`
+              }, rental.providerId);
+            }
           });
-          await WalletService.adjustBalance(rental.providerId, -comp, false);
-          await WalletService.adjustBalance(rental.renterId, comp, false);
-          await completeSettlementStep(claim, rental.renterId);
-          await TransactionService.create({
-            type: 'refund',
-            status: 'completed',
-            amount: -comp,
-            relatedId: id,
-            description: `Provider early-end compensation (${endReason})`
-          }, rental.providerId);
         }
       }
     } catch (err) {
@@ -1475,8 +1489,8 @@ const TransactionService = {
 
     if (filters.type) query = query.eq('type', filters.type);
 
-    const page = parseInt(options.page) || 1;
-    const limit = parseInt(options.limit) || 20;
+    const page = Math.max(parseInt(options.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(options.limit, 10) || 20, 1), 200);
     query = query.order('created_at', { ascending: false })
       .range((page - 1) * limit, page * limit - 1);
 

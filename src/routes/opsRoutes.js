@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const ops = require('../services/opsService');
 const { auth, adminAuth } = require('../middleware/auth');
-const { isUuid } = require('../middleware/validation');
+const { isUuid, parsePagedQuery } = require('../middleware/validation');
 
 const handleError = (error, res) => {
   if (error instanceof ops.OpsUnavailable) return res.status(503).json({ success: false, code: error.code, message: error.message });
@@ -22,7 +22,8 @@ router.post('/tickets', auth, async (req, res) => {
 });
 router.get('/tickets', auth, async (req, res) => {
   try {
-    const tickets = await ops.listTickets({ userId: req.user.id, status: req.query.status, limit: Number(req.query.limit) || 50 });
+    const { limit } = parsePagedQuery(req.query, { limit: 50 });
+    const tickets = await ops.listTickets({ userId: req.user.id, status: req.query.status, limit });
     res.json({ success: true, tickets });
   } catch (e) { handleError(e, res); }
 });
@@ -51,7 +52,8 @@ router.patch('/tickets/:id', auth, adminAuth, async (req, res) => {
 });
 router.get('/tickets/admin/all', auth, adminAuth, async (req, res) => {
   try {
-    const tickets = await ops.listTickets({ status: req.query.status, limit: Number(req.query.limit) || 50 });
+    const { limit } = parsePagedQuery(req.query, { limit: 50 });
+    const tickets = await ops.listTickets({ status: req.query.status, limit });
     res.json({ success: true, tickets });
   } catch (e) { handleError(e, res); }
 });
@@ -59,7 +61,8 @@ router.get('/tickets/admin/all', auth, adminAuth, async (req, res) => {
 // Notifications
 router.get('/notifications', auth, async (req, res) => {
   try {
-    const notifications = await ops.listNotifications(req.user.id, { unreadOnly: req.query.unread === 'true', limit: Number(req.query.limit) || 50 });
+    const { limit } = parsePagedQuery(req.query, { limit: 50 });
+    const notifications = await ops.listNotifications(req.user.id, { unreadOnly: req.query.unread === 'true', limit });
     res.json({ success: true, notifications });
   } catch (e) { handleError(e, res); }
 });

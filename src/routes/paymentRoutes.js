@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { TransactionService, WalletService } = require('../services/supabaseService');
 const { auth } = require('../middleware/auth');
+const { parsePagedQuery } = require('../middleware/validation');
 // Payments are switchable (safe default OFF) until the real gateway is wired.
 // Reads/wallet/ledger stay live; only MONEY INTAKE returns a clean 503 while off,
 // so clients get one predictable answer instead of rows that never settle.
@@ -63,7 +64,8 @@ router.post('/deposit', auth, async (req, res) => {
 // @access  Private
 router.get('/transactions', auth, async (req, res) => {
   try {
-    const { page = 1, limit = 20, type } = req.query;
+    const { type } = req.query;
+    const { page, limit } = parsePagedQuery(req.query);
 
     const result = await TransactionService.findByUserId(req.user.id, { type }, { page, limit });
     res.json({ success: true, ...result });

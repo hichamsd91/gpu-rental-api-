@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const rep = require('../services/reputationService');
 const { auth, adminAuth } = require('../middleware/auth');
-const { isUuid } = require('../middleware/validation');
+const { isUuid, parsePagedQuery } = require('../middleware/validation');
 
 const handleError = (error, res) => {
   if (error instanceof rep.ReputationUnavailable) return res.status(503).json({ success: false, code: error.code, message: error.message });
@@ -39,7 +39,8 @@ router.post('/disputes', auth, async (req, res) => {
 
 router.get('/disputes', auth, adminAuth, async (req, res) => {
   try {
-    const disputes = await rep.listDisputes({ status: req.query.status, limit: Number(req.query.limit) || 50 });
+    const { limit } = parsePagedQuery(req.query, { limit: 50 });
+    const disputes = await rep.listDisputes({ status: req.query.status, limit });
     res.json({ success: true, disputes });
   } catch (e) { handleError(e, res); }
 });

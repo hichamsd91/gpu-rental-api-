@@ -21,7 +21,7 @@ const SB = env.SUPABASE_URL;
 const KEY = env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY;
 const svc = { apikey: KEY, Authorization: 'Bearer ' + KEY, 'Content-Type': 'application/json' };
 
-const DELETE_EMAILS = ['renter.test@veloxora-test.dev', 'provider.test@veloxora-test.dev'];
+const DELETE_EMAILS = ['renter.test@veloxora-test.dev', 'provider.test@veloxora-test.dev', 'stranger.test@veloxora-test.dev'];
 
 const idsFromEnv = () => {
   const state = fs.existsSync(FIXTURES) ? JSON.parse(fs.readFileSync(FIXTURES, 'utf8')) : {};

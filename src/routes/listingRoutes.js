@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { GpuListingService, DeviceService } = require('../services/supabaseService');
 const { auth, providerAuth } = require('../middleware/auth');
-const { isUuid } = require('../middleware/validation');
+const { isUuid, parsePagedQuery } = require('../middleware/validation');
 
 // Every route below addresses a listing by uuid. Reject malformed ids here so
 // PostgREST never sees them (an invalid uuid used to surface as a 500).
@@ -19,8 +19,6 @@ router.param('id', (req, res, next, id) => {
 router.get('/', async (req, res) => {
   try {
     const {
-      page = 1,
-      limit = 20,
       search = '',
       brand = '',
       minVram = '',
@@ -28,6 +26,8 @@ router.get('/', async (req, res) => {
       purpose = '',
       sortBy = 'price_asc'
     } = req.query;
+    // Never let `?limit=100000` turn the catalog into a bulk export.
+    const { page, limit } = parsePagedQuery(req.query);
 
     const result = await GpuListingService.findAll({
       status: 'active',
