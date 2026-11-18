@@ -17,7 +17,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const { call, EMAIL, PASSWORD } = require('./lib');
-const { sbGet, ensureWallet, walletOf, provision } = require('./fixtures');
+const { sbGet, sbPatch, ensureWallet, walletOf, provision } = require('./fixtures');
 
 const AGENT_DIR = path.resolve(__dirname, '../../../worker-agent');
 const API_BASE = process.env.E2E_BASE || 'http://127.0.0.1:5000/api';
@@ -273,6 +273,54 @@ async function scenario({ name, listing, jobBody, expect }, ids) {
     await call('POST', `/rentals/${guard.body.rental.id}/end`, { token: fx.renterToken, body: {} });
   } else {
     check('inference rental for the allowlist check', false, `${guard.status}`);
+  }
+
+  // ── 4. Recovery — a crashed agent's job is finished by the next agent ────
+  await ensureWallet(fx.renterId, 0);
+  const recovery = await call('POST', '/rentals', {
+    token: fx.renterToken,
+    body: { listingId: beam.id, plannedDurationMinutes: 30, purpose: 'rendering' }
+  });
+  check('recovery: rental created', recovery.status === 201, `${recovery.status}`);
+  if (recovery.status === 201) {
+    const rentalId = recovery.body.rental.id;
+    await ensureWallet(fx.renterId, 5);
+    await call('POST', `/rentals/${rentalId}/start`, { token: fx.renterToken, body: {} });
+    const submitted = await call('POST', `/rentals/${rentalId}/job`, {
+      token: fx.renterToken,
+      body: { kind: 'render.mandelbrot', params: { width: 128, height: 96, iterations: 20 } }
+    });
+    check('recovery: job queued', submitted.status === 201, `${submitted.status}`);
+
+    // Simulate an agent that claimed the job and died: running, no updates since.
+    const stale = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    const marked = await sbPatch('session_jobs', `rental_id=eq.${rentalId}`, {
+      status: 'running', claimed_at: stale, started_at: stale, updated_at: stale, progress: 25
+    });
+    check(
+      'recovery: simulated crashed agent (running, stale)',
+      Array.isArray(marked) && marked[0] && marked[0].status === 'running',
+      Array.isArray(marked) ? marked[0] && marked[0].status : 'patch failed'
+    );
+
+    const rescued = await runAgent(fx.deviceId);
+    check(
+      'recovery: the next agent reclaims and finishes the job',
+      rescued.code === 0 && rescued.summary && rescued.summary.status === 'succeeded',
+      `exit=${rescued.code} ${JSON.stringify(rescued.summary).slice(0, 140)}`
+    );
+
+    const after = await call('GET', `/rentals/${rentalId}/job`, { token: fx.renterToken });
+    const job = after.body && after.body.job;
+    check(
+      'recovery: the renter sees a succeeded job with its artifact',
+      job && job.status === 'succeeded' && job.progress === 100 &&
+        job.result && job.result.artifact && job.result.artifact.bytes > 0,
+      job && `${job.status} ${job.progress}%`
+    );
+
+    const ended = await call('POST', `/rentals/${rentalId}/end`, { token: fx.renterToken, body: {} });
+    check('recovery: session ended and settled', ended.status === 200, `${ended.status}`);
   }
 
   console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL CHECKS PASSED');
