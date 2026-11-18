@@ -17,6 +17,10 @@ const { getSupabaseClient } = require('../config/supabase');
 const TABLE = 'session_jobs';
 const LOG_LIMIT = 8000;
 const RESULT_LIMIT = 256 * 1024;
+// A claimed job whose row has not moved for this long is treated as abandoned
+// (the agent crashed): longer than the biggest preset timeout, so a healthy run
+// can never be stolen mid-flight.
+const STALE_CLAIM_SECONDS = 240;
 
 class JobError extends Error {
   constructor(message, code, status = 400) {
@@ -114,6 +118,8 @@ const publicJob = (row) => {
 
 const client = () => getSupabaseClient(true);
 
+const staleCutoffIso = () => new Date(Date.now() - STALE_CLAIM_SECONDS * 1000).toISOString();
+
 const wrap = (error) => {
   if (error instanceof JobError) return error;
   if (isMissingTable(error)) {
@@ -209,7 +215,22 @@ const pendingForDevice = async ({ providerId, deviceId }) => {
       .eq('status', 'queued');
     if (jobError) throw jobError;
 
-    return (jobs || []).map(publicJob);
+    // Work whose agent died mid-run goes back on the queue after the stale
+    // window, otherwise a crash leaves a paid session with a job nobody can
+    // finish and no way to submit another (one job per rental).
+    const { data: abandoned, error: abandonedError } = await db
+      .from(TABLE)
+      .select('*')
+      .in('rental_id', rentals.map((r) => r.id))
+      .eq('status', 'running')
+      .lt('updated_at', staleCutoffIso());
+    if (abandonedError) throw abandonedError;
+
+    const byRental = new Map();
+    for (const row of [...(jobs || []), ...(abandoned || [])]) {
+      byRental.set(row.rental_id, publicJob(row));
+    }
+    return [...byRental.values()];
   } catch (error) {
     throw wrap(error);
   }
@@ -237,10 +258,35 @@ const claim = async ({ rental, job, deviceId }) => {
       .select()
       .maybeSingle();
     if (error) throw error;
-    if (!data) return null;
-    const claimed = publicJob(data);
-    claimed.deviceId = deviceId;
-    return claimed;
+    if (data) {
+      const claimed = publicJob(data);
+      claimed.deviceId = deviceId;
+      return claimed;
+    }
+
+    // The first agent may have crashed with the job in 'running'. Only a row that
+    // has been quiet longer than any preset can run is taken over; the conditional
+    // UPDATE keeps the takeover atomic (two agents cannot both win it).
+    const { data: abandoned, error: abandonedError } = await client()
+      .from(TABLE)
+      .update({
+        status: 'running',
+        claimed_at: now,
+        started_at: now,
+        updated_at: now
+      })
+      .eq('rental_id', job.rentalId)
+      .eq('status', 'running')
+      .lt('updated_at', staleCutoffIso())
+      .select()
+      .maybeSingle();
+    if (abandonedError) throw abandonedError;
+    if (!abandoned) return null;
+
+    const reclaimed = publicJob(abandoned);
+    reclaimed.deviceId = deviceId;
+    reclaimed.reclaimed = true;
+    return reclaimed;
   } catch (error) {
     throw wrap(error);
   }

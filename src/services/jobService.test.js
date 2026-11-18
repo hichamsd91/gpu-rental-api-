@@ -7,11 +7,14 @@ const mockState = {
   failNext: null
 };
 
-const mockMatches = (filters, row) => filters.every(([key, value]) => (
-  Array.isArray(value) ? value.includes(row[key]) : row[key] === value
-));
+const mockMatches = (filters, row) => filters.every(([key, op, value]) => {
+  if (op === 'in') return Array.isArray(value) && value.includes(row[key]);
+  if (op === 'lt') return row[key] != null && String(row[key]) < String(value);
+  return row[key] === value;
+});
 
-const mockQuery = (table, op, payload) => {  const state = { filters: [], single: false };
+const mockQuery = (table, op, payload) => {
+  const state = { filters: [], single: false };
   const query = {};
   const run = () => {
     if (mockState.failNext && mockState.failNext.table === table) {
@@ -40,8 +43,9 @@ const mockQuery = (table, op, payload) => {  const state = { filters: [], single
   };
 
   query.select = () => query;
-  query.eq = (key, value) => { state.filters.push([key, value]); return query; };
-  query.in = (key, value) => { state.filters.push([key, value]); return query; };
+  query.eq = (key, value) => { state.filters.push([key, 'eq', value]); return query; };
+  query.in = (key, value) => { state.filters.push([key, 'in', value]); return query; };
+  query.lt = (key, value) => { state.filters.push([key, 'lt', value]); return query; };
   query.maybeSingle = () => { state.single = true; return Promise.resolve(run()); };
   query.single = () => { state.single = true; return Promise.resolve(run()); };
   query.then = (resolve, reject) => Promise.resolve(run()).then(resolve, reject);
@@ -192,6 +196,18 @@ describe('pendingForDevice', () => {
     expect(pending.map((job) => job.rentalId)).toEqual([RENTAL_ID]);
   });
 
+  test('work abandoned by a crashed agent is offered again, queued work still comes first', async () => {
+    mockState.rows.gpu_listings = [{ id: 'listing-1', provider_id: PROVIDER_ID, device_id: 'device-1' }];
+    mockState.rows.rentals = [{ id: RENTAL_ID, listing_id: 'listing-1', status: 'active' }];
+    mockState.rows.session_jobs = [
+      queuedJob({ status: 'running', updated_at: new Date(Date.now() - 15 * 60 * 1000).toISOString() })
+    ];
+
+    const pending = await jobs.pendingForDevice({ providerId: PROVIDER_ID, deviceId: 'device-1' });
+
+    expect(pending.map((job) => job.rentalId)).toEqual([RENTAL_ID]);
+  });
+
   test('a device with no listings has no work', async () => {
     await expect(jobs.pendingForDevice({ providerId: PROVIDER_ID, deviceId: 'device-1' })).resolves.toEqual([]);
   });
@@ -214,6 +230,30 @@ describe('claim', () => {
   test('a job whose session already ended is never claimed', async () => {
     mockState.rows.session_jobs = [queuedJob()];
     await expect(jobs.claim({ rental: rental({ status: 'ended' }), job: { rentalId: RENTAL_ID }, deviceId: 'd' }))
+      .resolves.toBeNull();
+  });
+
+  test('a job left running by a crashed agent is taken over after the stale window', async () => {
+    mockState.rows.session_jobs = [queuedJob({
+      status: 'running',
+      updated_at: new Date(Date.now() - 15 * 60 * 1000).toISOString()
+    })];
+
+    const reclaimed = await jobs.claim({ rental: rental(), job: { rentalId: RENTAL_ID }, deviceId: 'device-2' });
+
+    expect(reclaimed.status).toBe('running');
+    expect(reclaimed.reclaimed).toBe(true);
+    expect(reclaimed.deviceId).toBe('device-2');
+    expect(mockState.rows.session_jobs[0].status).toBe('running');
+  });
+
+  test('a healthy running job is never stolen from the agent working on it', async () => {
+    mockState.rows.session_jobs = [queuedJob({
+      status: 'running',
+      updated_at: new Date().toISOString()
+    })];
+
+    await expect(jobs.claim({ rental: rental(), job: { rentalId: RENTAL_ID }, deviceId: 'device-2' }))
       .resolves.toBeNull();
   });
 });
