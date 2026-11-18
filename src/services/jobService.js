@@ -1,128 +1,354 @@
 /**
- * Job queue service — durable background work (settlement, timeouts, payouts).
+ * Session jobs — the bridge between a paid, running rental and the provider's
+ * worker agent.
  *
- * Storage is the `jobs` table (migration 007). Two SQL functions do the part
- * that must be atomic:
- *   claim_jobs(worker, batch)  -> SELECT ... FOR UPDATE SKIP LOCKED + mark running
- *   finish_job(id, status, err)-> succeed, or re-queue with exponential backoff
+ * The renter never gets a shell. A job is a *kind* plus numeric parameters,
+ * validated against a server-side allowlist (JOB_KINDS). The provider's agent
+ * claims it, executes exactly that kind with a local preset, and reports the
+ * result. That keeps "renting a GPU" from turning into remote code execution on
+ * a stranger's machine.
  *
- * Doing the claim in Node instead would let two workers pick the same row and
- * settle a rental twice. That is the whole reason this module is thin.
+ * One job per rental (primary key). Claiming is an atomic UPDATE guarded by
+ * status = 'queued', so two agents can never run the same job twice.
  */
+const crypto = require('crypto');
 const { getSupabaseClient } = require('../config/supabase');
 
-const TABLE = 'jobs';
-const MAX_BATCH = 50;
-const MAX_ERROR = 2000;
-const KINDS = new Set([
-  'rental.settle',
-  'rental.auto_stop',
-  'rental.expire',
-  'payout.release',
-  'dispute.timeout',
-  'identity.recluster',
-  'notification.send'
-]);
+const TABLE = 'session_jobs';
+const LOG_LIMIT = 8000;
+const RESULT_LIMIT = 256 * 1024;
 
-const assertKind = (kind) => {
-  if (typeof kind !== 'string' || kind.trim() === '') throw new TypeError('job kind is required');
-  const value = kind.trim();
-  // Unknown kinds are programmer errors: a typo would otherwise sit in the queue
-  // forever because no worker claims it.
-  if (!KINDS.has(value)) throw new TypeError(`unknown job kind: ${value}`);
-  return value;
+class JobError extends Error {
+  constructor(message, code, status = 400) {
+    super(message);
+    this.name = 'JobError';
+    this.code = code;
+    this.status = status;
+  }
+}
+
+const isMissingTable = (error) => error && (
+  error.code === '42P01' ||
+  error.code === 'PGRST205' ||
+  /does not exist|schema cache/i.test(String(error.message || ''))
+);
+
+// ── The allowlist ────────────────────────────────────────────────────────────
+// Every entry is a preset that ships with the worker agent. Parameters are
+// numbers in a closed range — nothing here can be turned into a command.
+const JOB_KINDS = {
+  'render.mandelbrot': {
+    purpose: 'rendering',
+    label: 'GPU render (Mandelbrot)',
+    timeoutSeconds: 180,
+    params: {
+      width: { min: 64, max: 1024, default: 320, integer: true },
+      height: { min: 64, max: 1024, default: 240, integer: true },
+      iterations: { min: 10, max: 500, default: 80, integer: true }
+    }
+  },
+  'compute.matmul': {
+    purpose: 'compute',
+    label: 'GPU compute (matrix multiply)',
+    timeoutSeconds: 300,
+    params: {
+      size: { min: 256, max: 4096, default: 1024, integer: true },
+      repeats: { min: 1, max: 20, default: 3, integer: true }
+    }
+  }
 };
 
-/**
- * Enqueue a job. With `dedupeKey`, a second enqueue of the same key is a no-op
- * (returns { id: null, deduped: true }) — the database enforces it, not this code.
- */
-const enqueue = async (kind, payload = {}, { runAfter = null, maxAttempts = 5, dedupeKey = null } = {}) => {
-  const normalizedKind = assertKind(kind);
-  if (payload !== null && typeof payload !== 'object') {
-    throw new TypeError('job payload must be an object');
+// Which kinds a purpose may run. Mining has no executor yet: the platform
+// allows a mining rental, but it must not pretend it can run the work.
+const PURPOSE_KINDS = {
+  rendering: ['render.mandelbrot'],
+  training: ['compute.matmul'],
+  inference: ['compute.matmul'],
+  research: ['compute.matmul'],
+  mining: []
+};
+
+const normalizeSpec = (kind, rawParams) => {
+  const definition = JOB_KINDS[kind];
+  if (!definition) {
+    throw new JobError(`Unknown job kind "${kind}"`, 'job_kind_unknown');
   }
-
-  const row = {
-    kind: normalizedKind,
-    payload: payload || {},
-    max_attempts: Math.max(1, Math.min(Number(maxAttempts) || 5, 50))
-  };
-  if (runAfter) {
-    const when = runAfter instanceof Date ? runAfter : new Date(runAfter);
-    if (Number.isNaN(when.getTime())) throw new TypeError('runAfter is not a valid date');
-    row.run_after = when.toISOString();
+  const input = rawParams && typeof rawParams === 'object' && !Array.isArray(rawParams) ? rawParams : {};
+  const spec = {};
+  for (const [name, rule] of Object.entries(definition.params)) {
+    const raw = input[name];
+    if (raw === undefined || raw === null || raw === '') {
+      spec[name] = rule.default;
+      continue;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || (rule.integer && !Number.isInteger(value))) {
+      throw new JobError(`Parameter "${name}" must be ${rule.integer ? 'a whole number' : 'a number'}`, 'job_param_invalid');
+    }
+    if (value < rule.min || value > rule.max) {
+      throw new JobError(`Parameter "${name}" must be between ${rule.min} and ${rule.max}`, 'job_param_invalid');
+    }
+    spec[name] = value;
   }
-  if (dedupeKey) row.dedupe_key = String(dedupeKey).slice(0, 200);
+  return spec;
+};
 
-  const client = getSupabaseClient(true);
+const toCamel = (row) => {
+  if (!row) return row;
+  const out = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = value;
+  }
+  return out;
+};
 
-  if (row.dedupe_key) {
-    const { data, error } = await client
+const publicJob = (row) => {
+  const job = toCamel(row);
+  if (!job) return job;
+  // The result carries anything the agent chose to report; keep the API shape
+  // stable and let the client decide what to render.
+  job.kindLabel = JOB_KINDS[job.kind] ? JOB_KINDS[job.kind].label : job.kind;
+  job.spec = job.spec || {};
+  return job;
+};
+
+const client = () => getSupabaseClient(true);
+
+const wrap = (error) => {
+  if (error instanceof JobError) return error;
+  if (isMissingTable(error)) {
+    return new JobError('The job queue is not available on this deployment', 'jobs_unavailable', 503);
+  }
+  return error;
+};
+
+const findByRental = async (rentalId) => {
+  try {
+    const { data, error } = await client()
       .from(TABLE)
-      .upsert(row, { onConflict: 'dedupe_key', ignoreDuplicates: true })
-      .select('id')
+      .select('*')
+      .eq('rental_id', rentalId)
       .maybeSingle();
-    if (error) throw new Error(`job enqueue failed: ${error.message}`);
-    return data?.id ? { id: data.id, deduped: false } : { id: null, deduped: true };
+    if (error) throw error;
+    return publicJob(data);
+  } catch (error) {
+    throw wrap(error);
   }
-
-  const { data, error } = await client.from(TABLE).insert(row).select('id').single();
-  if (error) throw new Error(`job enqueue failed: ${error.message}`);
-  return { id: data.id, deduped: false };
-};
-
-/** Claim up to `batch` due jobs for this worker. Returns the claimed rows. */
-const claim = async ({ worker, batch = 1 } = {}) => {
-  if (typeof worker !== 'string' || worker.trim() === '') throw new TypeError('worker id is required');
-  const size = Math.max(1, Math.min(Number(batch) || 1, MAX_BATCH));
-
-  const client = getSupabaseClient(true);
-  const { data, error } = await client.rpc('claim_jobs', {
-    p_worker: worker.trim().slice(0, 120),
-    p_batch: size
-  });
-  if (error) throw new Error(`job claim failed: ${error.message}`);
-  return Array.isArray(data) ? data : [];
 };
 
 /**
- * Report a claimed job's outcome. On 'failed' the database decides between a
- * retry (with backoff) and the 'dead' state — that logic must not be duplicated
- * in Node, or two schedulers could disagree about the attempt count.
+ * Renter submits the work for a running session. The purpose of the rental
+ * decides what is allowed, so a rendering session cannot ask for a training
+ * job (and vice versa).
  */
-const finish = async (id, { status, error = null } = {}) => {
-  if (!id) throw new TypeError('job id is required');
-  if (status !== 'succeeded' && status !== 'failed') {
-    throw new TypeError(`invalid finish status: ${status}`);
+const submit = async ({ rental, userId, kind, params }) => {
+  if (!rental || String(rental.renterId) !== String(userId)) {
+    throw new JobError('This session is not yours', 'forbidden', 403);
+  }
+  if (rental.status !== 'active') {
+    throw new JobError('The session is not running', 'rental_not_active', 409);
+  }
+  const purpose = rental.purpose || null;
+  if (!purpose) {
+    throw new JobError('This session has no declared purpose', 'purpose_required');
+  }
+  const allowed = PURPOSE_KINDS[purpose] || [];
+  if (!allowed.length) {
+    throw new JobError(`No worker executor is installed for "${purpose}" sessions yet`, 'job_kind_unavailable', 501);
+  }
+  if (!allowed.includes(kind)) {
+    throw new JobError(
+      `A "${purpose}" session cannot run "${kind}". Allowed: ${allowed.join(', ')}`,
+      'job_kind_not_allowed'
+    );
   }
 
-  const client = getSupabaseClient(true);
-  const { data, error: rpcError } = await client.rpc('finish_job', {
-    p_id: id,
-    p_status: status,
-    p_error: error ? String(error).slice(0, MAX_ERROR) : null
-  });
-  if (rpcError) throw new Error(`job finish failed: ${rpcError.message}`);
-  return data;
-};
-
-const succeed = (id) => finish(id, { status: 'succeeded' });
-const fail = (id, error) => finish(id, { status: 'failed', error: error?.message ? error.message : String(error || 'unknown error') });
-
-/** Small helper for the future dashboard: queue depth by status. */
-const stats = async () => {
-  const client = getSupabaseClient(true);
-  const counts = {};
-  for (const status of ['queued', 'running', 'succeeded', 'failed', 'dead']) {
-    const { count, error } = await client
+  const spec = normalizeSpec(kind, params);
+  try {
+    const { data, error } = await client()
       .from(TABLE)
-      .select('id', { count: 'exact', head: true })
-      .eq('status', status);
-    if (error) throw new Error(`job stats failed: ${error.message}`);
-    counts[status] = count || 0;
+      .insert([{ rental_id: rental.id, kind, spec, status: 'queued' }])
+      .select()
+      .single();
+    if (error) {
+      if (error.code === '23505') {
+        throw new JobError('A job is already queued for this session', 'job_exists', 409);
+      }
+      throw error;
+    }
+    return publicJob(data);
+  } catch (error) {
+    throw wrap(error);
   }
-  return counts;
 };
 
-module.exports = { enqueue, claim, finish, succeed, fail, stats, KINDS, TABLE, MAX_BATCH };
+/** Active rentals on one device, with their queued job if any. */
+const pendingForDevice = async ({ providerId, deviceId }) => {
+  try {
+    const db = client();
+    const { data: listings, error: listingError } = await db
+      .from('gpu_listings')
+      .select('id')
+      .eq('provider_id', providerId)
+      .eq('device_id', deviceId);
+    if (listingError) throw listingError;
+    if (!listings || !listings.length) return [];
+
+    const { data: rentals, error: rentalError } = await db
+      .from('rentals')
+      .select('id, listing_id, purpose, status')
+      .in('listing_id', listings.map((l) => l.id))
+      .eq('status', 'active');
+    if (rentalError) throw rentalError;
+    if (!rentals || !rentals.length) return [];
+
+    const { data: jobs, error: jobError } = await db
+      .from(TABLE)
+      .select('*')
+      .in('rental_id', rentals.map((r) => r.id))
+      .eq('status', 'queued');
+    if (jobError) throw jobError;
+
+    return (jobs || []).map(publicJob);
+  } catch (error) {
+    throw wrap(error);
+  }
+};
+
+/**
+ * Atomically take a queued job. Returns null when someone else already took it
+ * (that is a normal race, not an error) or when the session is no longer live.
+ */
+const claim = async ({ rental, job, deviceId }) => {
+  if (!job) return null;
+  if (rental.status !== 'active') return null;
+  try {
+    const now = new Date().toISOString();
+    const { data, error } = await client()
+      .from(TABLE)
+      .update({
+        status: 'running',
+        claimed_at: now,
+        started_at: now,
+        updated_at: now
+      })
+      .eq('rental_id', job.rentalId)
+      .eq('status', 'queued')
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return null;
+    const claimed = publicJob(data);
+    claimed.deviceId = deviceId;
+    return claimed;
+  } catch (error) {
+    throw wrap(error);
+  }
+};
+
+/** Append a progress line. Returns the job's current status so the agent can
+ *  stop a job whose session was ended under it. */
+const progress = async ({ rentalId, message, percent, telemetry }) => {
+  try {
+    const { data: job, error } = await client()
+      .from(TABLE)
+      .select('*')
+      .eq('rental_id', rentalId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!job) throw new JobError('Job not found', 'not_found', 404);
+    if (job.status !== 'running') {
+      return { accepted: false, status: job.status };
+    }
+
+    // A rental can end while the GPU is still crunching. The session is the
+    // contract, so the job is cancelled here and the agent is told to stop —
+    // otherwise a provider keeps billing for work nobody ordered any more.
+    const { data: rental, error: rentalError } = await client()
+      .from('rentals')
+      .select('status')
+      .eq('id', rentalId)
+      .maybeSingle();
+    if (rentalError) throw rentalError;
+    if (!rental || rental.status !== 'active') {
+      const now = new Date().toISOString();
+      const line = `[${now.slice(11, 19)}] session is no longer running — job cancelled\n`;
+      await client()
+        .from(TABLE)
+        .update({
+          status: 'cancelled',
+          log: `${job.log || ''}${line}`.slice(-LOG_LIMIT),
+          finished_at: now,
+          updated_at: now
+        })
+        .eq('rental_id', rentalId)
+        .eq('status', 'running');
+      return { accepted: false, status: 'cancelled' };
+    }
+    const stamp = new Date().toISOString().slice(11, 19);
+    const line = `[${stamp}]${Number.isFinite(Number(percent)) ? ` ${Math.round(Number(percent))}%` : ''} ${String(message || '').slice(0, 500)}\n`;
+    const log = `${job.log || ''}${line}`.slice(-LOG_LIMIT);
+    const patch = { log, updated_at: new Date().toISOString() };
+    if (Number.isFinite(Number(percent))) patch.progress = Math.max(0, Math.min(100, Math.round(Number(percent))));
+    if (telemetry && typeof telemetry === 'object') patch.telemetry = telemetry;
+    const { error: updateError } = await client().from(TABLE).update(patch).eq('rental_id', rentalId);
+    if (updateError) throw updateError;
+    return { accepted: true, status: 'running' };
+  } catch (error) {
+    throw wrap(error);
+  }
+};
+
+const complete = async ({ rentalId, status, exitCode, result, log }) => {
+  if (!['succeeded', 'failed', 'cancelled'].includes(status)) {
+    throw new JobError('status must be succeeded, failed or cancelled', 'job_status_invalid');
+  }
+  const encoded = result === undefined ? null : JSON.stringify(result);
+  if (encoded && encoded.length > RESULT_LIMIT) {
+    throw new JobError('Job result is too large', 'job_result_too_large', 413);
+  }
+  try {
+    const now = new Date().toISOString();
+    const patch = {
+      status,
+      exit_code: Number.isFinite(Number(exitCode)) ? Number(exitCode) : null,
+      result: result === undefined ? null : result,
+      finished_at: now,
+      updated_at: now
+    };
+    if (log) patch.log = `${log}`.slice(-LOG_LIMIT);
+    const { data, error } = await client()
+      .from(TABLE)
+      .update(patch)
+      .eq('rental_id', rentalId)
+      .eq('status', 'running')
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return publicJob(data);
+    // Already terminal: answer with the stored row (idempotent retry).
+    const existing = await findByRental(rentalId);
+    if (!existing) throw new JobError('Job not found', 'not_found', 404);
+    return existing;
+  } catch (error) {
+    throw wrap(error);
+  }
+};
+
+const checksum = (value) => crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+
+module.exports = {
+  JobError,
+  JOB_KINDS,
+  PURPOSE_KINDS,
+  LOG_LIMIT,
+  RESULT_LIMIT,
+  normalizeSpec,
+  findByRental,
+  submit,
+  pendingForDevice,
+  claim,
+  progress,
+  complete,
+  checksum
+};

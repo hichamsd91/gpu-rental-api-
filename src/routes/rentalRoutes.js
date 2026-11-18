@@ -3,6 +3,7 @@ const router = express.Router();
 const { RentalService, GpuListingService } = require('../services/supabaseService');
 const catalog = require('../services/catalogService');
 const featureFlags = require('../services/featureFlagService');
+const jobs = require('../services/jobService');
 const { usdToTokens } = require('../utils/pricing');
 const { auth } = require('../middleware/auth');
 const { isUuid, parsePagedQuery } = require('../middleware/validation');
@@ -354,6 +355,55 @@ router.post('/:id/cancel', auth, async (req, res) => {
     if (forbidden(error)) {
       return res.status(403).json({ success: false, code: 'forbidden', message: 'You are not allowed to cancel this rental' });
     }
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @desc    Read the work submitted for this session (renter's own / provider's own)
+// @route   GET /api/rentals/:id/job
+// @access  Private
+router.get('/:id/job', auth, async (req, res) => {
+  try {
+    const rental = await RentalService.findById(req.params.id);
+    if (!rental) return res.status(404).json({ message: 'Rental not found' });
+    if (!canManageRental(req, rental)) {
+      return res.status(403).json({ message: 'Not authorized to view this rental' });
+    }
+    const job = await jobs.findByRental(rental.id);
+    res.json({ success: true, job: job || null });
+  } catch (error) {
+    if (error instanceof jobs.JobError) {
+      return res.status(error.status).json({ success: false, code: error.code, message: error.message });
+    }
+    console.error('Get rental job error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @desc    Submit the GPU work for a running session (allowlisted job kind)
+// @route   POST /api/rentals/:id/job
+// @access  Private/Renter (owner)
+router.post('/:id/job', auth, async (req, res) => {
+  try {
+    const rental = await RentalService.findById(req.params.id);
+    if (!rental) return res.status(404).json({ message: 'Rental not found' });
+    if (req.user.role !== 'renter' || !idsEqual(rental.renterId, req.user.id)) {
+      return res.status(403).json({ message: 'Only the renter can submit work for this session' });
+    }
+
+    const { kind, params } = req.body || {};
+    const job = await jobs.submit({
+      rental,
+      userId: req.user.id,
+      kind: typeof kind === 'string' ? kind.trim() : '',
+      params
+    });
+    res.status(201).json({ success: true, job, availableKinds: jobs.PURPOSE_KINDS[rental.purpose] || [] });
+  } catch (error) {
+    if (error instanceof jobs.JobError) {
+      return res.status(error.status).json({ success: false, code: error.code, message: error.message });
+    }
+    console.error('Submit rental job error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

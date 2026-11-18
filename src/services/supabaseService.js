@@ -136,7 +136,7 @@ const DEVICE_UPDATE_FIELDS = [
   'name', 'hostname', 'osName', 'osVersion', 'networkInfo', 'agentVersion', 'autoStartEnabled'
 ];
 const HEARTBEAT_FIELDS = [
-  'gpuTemperature', 'gpuUtilization', 'vramUsedGb', 'vramTotalGb', 'powerUsageWatts'
+  'gpuTemperature', 'gpuUtilization', 'vramUsedGb', 'vramTotalGb', 'powerUsageWatts', 'agentVersion'
 ];
 // True while an additive migration has not run yet: PostgREST reports the
 // missing table/column either with a raw SQL code or as a schema-cache error
