@@ -40,9 +40,31 @@ jest.mock('../services/featureFlagService', () => ({
   enabledMap: jest.fn(async () => ({})),
 }));
 
+// The job routes talk to the queue service; keep this suite about the HTTP
+// contract (signed link, status codes, headers) with a controlled stub.
+jest.mock('../services/jobService', () => {
+  class JobError extends Error {
+    constructor(message, code, status = 400) {
+      super(message);
+      this.code = code;
+      this.status = status;
+    }
+  }
+  return {
+    JobError,
+    PURPOSE_KINDS: { rendering: ['render.mandelbrot'], compute: ['compute.matmul'] },
+    findByRental: jest.fn(),
+    forRenter: jest.fn((job) => job),
+    getArtifact: jest.fn(),
+    artifactLinkValid: jest.fn(),
+    submit: jest.fn(),
+  };
+});
+
 const { RentalService, GpuListingService } = require('../services/supabaseService');
 const catalog = require('../services/catalogService');
 const featureFlags = require('../services/featureFlagService');
+const jobs = require('../services/jobService');
 const rentalRoutes = require('./rentalRoutes');
 
 const app = express();
@@ -439,5 +461,55 @@ describe('GET /api/rentals/:id (owner-scoped read)', () => {
     expect(events.status).toBe(400);
 
     expect(RentalService.endRental).not.toHaveBeenCalled();
+  });
+});
+
+describe('job artifact delivery over a signed link', () => {
+  const RENTAL_ID = '11111111-1111-4111-8111-111111111111';
+  const png = Buffer.from('89504e470d0a1a0a', 'hex');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUser = { id: 'renter-1', role: 'renter' };
+  });
+
+  test('serves the exact bytes with download headers', async () => {
+    jobs.artifactLinkValid.mockReturnValue(true);
+    jobs.getArtifact.mockResolvedValue({ mime: 'image/png', filename: 'frame.png', bytes: png });
+
+    const res = await request(app).get(`/api/rentals/${RENTAL_ID}/job/artifact?exp=1&sig=x`);
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/image\/png/);
+    expect(res.headers['content-disposition']).toBe('attachment; filename="frame.png"');
+    expect(res.headers['cross-origin-resource-policy']).toBe('cross-origin');
+    expect(Buffer.from(res.body).equals(png)).toBe(true);
+  });
+
+  test('a wrong, edited or expired signature is refused before reading the artifact', async () => {
+    jobs.artifactLinkValid.mockReturnValue(false);
+
+    const res = await request(app).get(`/api/rentals/${RENTAL_ID}/job/artifact?exp=1&sig=00`);
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('artifact_link_invalid');
+    expect(jobs.getArtifact).not.toHaveBeenCalled();
+  });
+
+  test('a valid link with no stored artifact is an honest 404', async () => {
+    jobs.artifactLinkValid.mockReturnValue(true);
+    jobs.getArtifact.mockResolvedValue(null);
+
+    const res = await request(app).get(`/api/rentals/${RENTAL_ID}/job/artifact?exp=1&sig=x`);
+    expect(res.status).toBe(404);
+  });
+
+  test('the renter read attaches a link built from the request origin', async () => {
+    RentalService.findById.mockResolvedValue({ id: RENTAL_ID, renterId: 'renter-1', providerId: 'p-1', purpose: 'rendering' });
+    jobs.findByRental.mockResolvedValue({ rentalId: RENTAL_ID, status: 'succeeded' });
+    jobs.forRenter.mockImplementation((job, origin) => ({ ...job, origin }));
+
+    const res = await request(app).get(`/api/rentals/${RENTAL_ID}/job`);
+    expect(res.status).toBe(200);
+    expect(jobs.forRenter).toHaveBeenCalledWith(expect.objectContaining({ rentalId: RENTAL_ID }), expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/));
+    expect(res.body.job.origin).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
   });
 });

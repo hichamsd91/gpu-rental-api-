@@ -17,6 +17,13 @@ const { getSupabaseClient } = require('../config/supabase');
 const TABLE = 'session_jobs';
 const LOG_LIMIT = 8000;
 const RESULT_LIMIT = 256 * 1024;
+// Small artifacts ride inline in the poll response (the renter previews them
+// without a second request). Anything larger is delivered through a short-lived
+// signed link, so a 6-second poll never re-downloads megabytes of base64.
+const INLINE_ARTIFACT_LIMIT = 96 * 1024;
+const ARTIFACT_RAW_LIMIT = 4 * 1024 * 1024;
+const ARTIFACT_LINK_TTL_SECONDS = 15 * 60;
+const ARTIFACT_MIMES = new Set(['image/png', 'image/jpeg', 'application/zip', 'application/octet-stream']);
 // A claimed job whose row has not moved for this long is treated as abandoned
 // (the agent crashed): longer than the biggest preset timeout, so a healthy run
 // can never be stolen mid-flight.
@@ -345,11 +352,110 @@ const progress = async ({ rentalId, message, percent, telemetry }) => {
   }
 };
 
+const artifactSecret = () => process.env.ARTIFACT_SECRET || process.env.JWT_SECRET || 'dev-artifact-secret';
+
+const signArtifact = (rentalId, expiresAt) =>
+  crypto.createHmac('sha256', artifactSecret())
+    .update(`artifact:${rentalId}:${expiresAt}`)
+    .digest('hex');
+
+const artifactMime = (value) => (ARTIFACT_MIMES.has(String(value)) ? String(value) : 'application/octet-stream');
+
+const safeFilename = (raw, mime) => {
+  const fallback = `artifact${mime === 'image/png' ? '.png' : mime === 'image/jpeg' ? '.jpg' : '.bin'}`;
+  const name = typeof raw === 'string' ? raw.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) : '';
+  return name && name !== '.' && name !== '..' ? name : fallback;
+};
+
+/**
+ * The agent's artifact is untrusted input. Hash the decoded bytes, compare them
+ * with the checksum the agent reported (a mismatch is corrupt or tampered work),
+ * then sign the verified digest with the server secret so the delivery record is
+ * bound to this rental and cannot be swapped in a dispute.
+ */
+const verifyArtifact = (rentalId, result) => {
+  if (!result || typeof result !== 'object') return result;
+  const artifact = result.artifact;
+  if (!artifact || typeof artifact !== 'object' || typeof artifact.base64 !== 'string') return result;
+  const bytes = Buffer.from(artifact.base64, 'base64');
+  if (!bytes.length) throw new JobError('The artifact is empty', 'job_artifact_empty', 422);
+  if (bytes.length > ARTIFACT_RAW_LIMIT) {
+    throw new JobError('The artifact is too large', 'job_artifact_too_large', 413);
+  }
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  const short = digest.slice(0, 16);
+  const reported = typeof artifact.checksum === 'string' ? artifact.checksum.toLowerCase() : null;
+  if (reported && reported !== short) {
+    throw new JobError('The artifact does not match the checksum the agent reported', 'job_artifact_checksum_mismatch', 422);
+  }
+  const signature = crypto.createHmac('sha256', artifactSecret())
+    .update(`artifact:${rentalId}:${digest}:${bytes.length}`)
+    .digest('hex');
+  return {
+    ...result,
+    artifact: {
+      ...artifact,
+      mime: artifactMime(artifact.mime),
+      filename: safeFilename(artifact.filename, artifactMime(artifact.mime)),
+      bytes: bytes.length,
+      checksum: short,
+      verified: true,
+      signature
+    }
+  };
+};
+
+/**
+ * Renter-facing view: keep small artifacts inline for instant preview, add a
+ * signed download link, and drop inline base64 once it stops being small.
+ */
+const forRenter = (job, origin) => {
+  if (!job) return job;
+  const artifact = job.result && job.result.artifact;
+  if (!artifact || typeof artifact !== 'object' || typeof artifact.base64 !== 'string') return job;
+  const expiresAt = Math.floor(Date.now() / 1000) + ARTIFACT_LINK_TTL_SECONDS;
+  const sig = signArtifact(job.rentalId, expiresAt);
+  const path = `/api/rentals/${job.rentalId}/job/artifact?exp=${expiresAt}&sig=${sig}`;
+  const link = origin ? `${String(origin).replace(/\/+$/, '')}${path}` : path;
+  const next = {
+    ...artifact,
+    url: link,
+    expires_at: new Date(expiresAt * 1000).toISOString()
+  };
+  if (artifact.base64.length > INLINE_ARTIFACT_LIMIT) delete next.base64;
+  return { ...job, result: { ...job.result, artifact: next } };
+};
+
+const artifactLinkValid = (rentalId, exp, sig) => {
+  const expires = Number(exp);
+  if (!rentalId || !Number.isInteger(expires) || typeof sig !== 'string' || !/^[a-f0-9]{64}$/i.test(sig)) {
+    return false;
+  }
+  if (expires < Math.floor(Date.now() / 1000)) return false;
+  const expected = signArtifact(rentalId, expires);
+  const given = Buffer.from(sig, 'hex');
+  const want = Buffer.from(expected, 'hex');
+  return given.length === want.length && crypto.timingSafeEqual(given, want);
+};
+
+const getArtifact = async (rentalId) => {
+  const job = await findByRental(rentalId);
+  const artifact = job && job.result && job.result.artifact;
+  if (!artifact || typeof artifact.base64 !== 'string') return null;
+  const mime = artifactMime(artifact.mime);
+  return {
+    mime,
+    filename: safeFilename(artifact.filename, mime),
+    bytes: Buffer.from(artifact.base64, 'base64')
+  };
+};
+
 const complete = async ({ rentalId, status, exitCode, result, log }) => {
   if (!['succeeded', 'failed', 'cancelled'].includes(status)) {
     throw new JobError('status must be succeeded, failed or cancelled', 'job_status_invalid');
   }
-  const encoded = result === undefined ? null : JSON.stringify(result);
+  const hardened = verifyArtifact(rentalId, result);
+  const encoded = hardened === undefined ? null : JSON.stringify(hardened);
   if (encoded && encoded.length > RESULT_LIMIT) {
     throw new JobError('Job result is too large', 'job_result_too_large', 413);
   }
@@ -358,7 +464,7 @@ const complete = async ({ rentalId, status, exitCode, result, log }) => {
     const patch = {
       status,
       exit_code: Number.isFinite(Number(exitCode)) ? Number(exitCode) : null,
-      result: result === undefined ? null : result,
+      result: hardened === undefined ? null : hardened,
       finished_at: now,
       updated_at: now
     };
@@ -389,8 +495,13 @@ module.exports = {
   PURPOSE_KINDS,
   LOG_LIMIT,
   RESULT_LIMIT,
+  INLINE_ARTIFACT_LIMIT,
+  ARTIFACT_LINK_TTL_SECONDS,
   normalizeSpec,
   findByRental,
+  forRenter,
+  getArtifact,
+  artifactLinkValid,
   submit,
   pendingForDevice,
   claim,

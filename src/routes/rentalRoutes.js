@@ -370,7 +370,7 @@ router.get('/:id/job', auth, async (req, res) => {
       return res.status(403).json({ message: 'Not authorized to view this rental' });
     }
     const job = await jobs.findByRental(rental.id);
-    res.json({ success: true, job: job || null });
+    res.json({ success: true, job: job ? jobs.forRenter(job, `${req.protocol}://${req.get('host')}`) : null });
   } catch (error) {
     if (error instanceof jobs.JobError) {
       return res.status(error.status).json({ success: false, code: error.code, message: error.message });
@@ -398,12 +398,48 @@ router.post('/:id/job', auth, async (req, res) => {
       kind: typeof kind === 'string' ? kind.trim() : '',
       params
     });
-    res.status(201).json({ success: true, job, availableKinds: jobs.PURPOSE_KINDS[rental.purpose] || [] });
+    res.status(201).json({
+      success: true,
+      job: jobs.forRenter(job, `${req.protocol}://${req.get('host')}`),
+      availableKinds: jobs.PURPOSE_KINDS[rental.purpose] || []
+    });
   } catch (error) {
     if (error instanceof jobs.JobError) {
       return res.status(error.status).json({ success: false, code: error.code, message: error.message });
     }
     console.error('Submit rental job error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// @desc    Download the artifact produced by the session's job
+// @route   GET /api/rentals/:id/job/artifact?exp=…&sig=…
+// @access  Signed, short-lived link (bound to the rental, no session cookie)
+router.get('/:id/job/artifact', async (req, res) => {
+  try {
+    const { exp, sig } = req.query;
+    if (!jobs.artifactLinkValid(req.params.id, exp, sig)) {
+      return res.status(401).json({
+        success: false,
+        code: 'artifact_link_invalid',
+        message: 'This download link is invalid or has expired'
+      });
+    }
+    const artifact = await jobs.getArtifact(req.params.id);
+    if (!artifact) return res.status(404).json({ success: false, message: 'Artifact not found' });
+    res.setHeader('Content-Type', artifact.mime);
+    res.setHeader('Content-Length', artifact.bytes.length);
+    res.setHeader('Content-Disposition', `attachment; filename="${artifact.filename}"`);
+    // A signed link is already scoped to one artifact; let the browser keep it
+    // for its short lifetime instead of re-fetching on every dialog redraw.
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.send(artifact.bytes);
+  } catch (error) {
+    if (error instanceof jobs.JobError) {
+      return res.status(error.status).json({ success: false, code: error.code, message: error.message });
+    }
+    console.error('Download artifact error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

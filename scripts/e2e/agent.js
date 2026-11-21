@@ -14,6 +14,7 @@
 // Requirements: Python with pyopencl, an NVIDIA GPU, and node on PATH (the agent
 // uses the same node binary as this script).
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const { call, EMAIL, PASSWORD } = require('./lib');
@@ -152,12 +153,39 @@ async function scenario({ name, listing, jobBody, expect }, ids) {
       job && job.result && job.result.gflops);
   }
   if (expect.artifact) {
+    const artifact = job && job.result && job.result.artifact;
     check(
       `${name}: a real PNG artifact was produced`,
-      job && job.result && job.result.artifact && job.result.artifact.mime === 'image/png' &&
-        job.result.artifact.bytes > 0 && job.result.artifact.base64.length > 0,
-      job && job.result && job.result.artifact && job.result.artifact.bytes
+      artifact && artifact.mime === 'image/png' && artifact.bytes > 0 && artifact.base64.length > 0,
+      artifact && artifact.bytes
     );
+    check(
+      `${name}: the server re-hashed and signed the artifact`,
+      artifact && artifact.verified === true && /^[a-f0-9]{64}$/.test(String(artifact.signature)),
+      artifact && String(artifact.checksum)
+    );
+    check(
+      `${name}: a signed download link was issued`,
+      artifact && typeof artifact.url === 'string' && artifact.url.includes('/job/artifact?exp='),
+      artifact && artifact.url && artifact.url.slice(0, 72)
+    );
+    if (artifact && artifact.url) {
+      const dl = await fetch(artifact.url);
+      const bytes = Buffer.from(await dl.arrayBuffer());
+      const digest = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+      check(`${name}: the link returns the exact bytes`, dl.status === 200 && bytes.length === artifact.bytes,
+        `${dl.status} ${bytes.length}B`);
+      check(`${name}: downloaded bytes match the checksum`, digest === artifact.checksum, digest);
+      check(
+        `${name}: download is an attachment with the artifact mime`,
+        String(dl.headers.get('content-type')).startsWith('image/png') &&
+          /attachment; filename=".+\.png"/.test(String(dl.headers.get('content-disposition'))),
+        dl.headers.get('content-disposition')
+      );
+      const forged = artifact.url.replace(/sig=[a-f0-9]+/i, `sig=${'0'.repeat(64)}`);
+      const refused = await fetch(forged);
+      check(`${name}: a forged signature is refused`, refused.status === 401, `${refused.status}`);
+    }
   }
 
   // Telemetry from the agent's heartbeat must have landed on the device row.

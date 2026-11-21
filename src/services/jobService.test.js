@@ -335,3 +335,78 @@ describe('missing schema', () => {
       .rejects.toMatchObject({ code: 'jobs_unavailable', status: 503 });
   });
 });
+
+describe('artifact integrity and signed delivery', () => {
+  const crypto = require('crypto');
+  const png = Buffer.from('89504e470d0a1a0a-real-pixels', 'utf8');
+  const short = crypto.createHash('sha256').update(png).digest('hex').slice(0, 16);
+
+  const artifactResult = (overrides = {}) => ({
+    checksum: short,
+    seconds: 1.5,
+    artifact: { mime: 'image/png', filename: 'frame.png', bytes: 1, base64: png.toString('base64'), ...overrides }
+  });
+
+  test('complete() re-hashes the bytes and signs the verified digest', async () => {
+    mockState.rows.session_jobs = [queuedJob({ status: 'running' })];
+    const job = await jobs.complete({ rentalId: RENTAL_ID, status: 'succeeded', result: artifactResult() });
+    const artifact = job.result.artifact;
+    expect(artifact.verified).toBe(true);
+    expect(artifact.checksum).toBe(short);
+    expect(artifact.bytes).toBe(png.length);
+    expect(artifact.signature).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  test('a checksum that does not match the bytes is refused and nothing is stored', async () => {
+    mockState.rows.session_jobs = [queuedJob({ status: 'running' })];
+    await expect(jobs.complete({ rentalId: RENTAL_ID, status: 'succeeded', result: artifactResult({ checksum: 'deadbeefdeadbeef' }) }))
+      .rejects.toMatchObject({ code: 'job_artifact_checksum_mismatch', status: 422 });
+    expect(mockState.rows.session_jobs[0].status).toBe('running');
+    expect(mockState.rows.session_jobs[0].result).toBeNull();
+  });
+
+  test('an empty artifact is refused instead of delivered', async () => {
+    mockState.rows.session_jobs = [queuedJob({ status: 'running' })];
+    await expect(jobs.complete({ rentalId: RENTAL_ID, status: 'succeeded', result: artifactResult({ base64: '' }) }))
+      .rejects.toMatchObject({ code: 'job_artifact_empty', status: 422 });
+  });
+
+  test('forRenter() adds an absolute, expiring, rental-bound download link', () => {
+    const view = jobs.forRenter(
+      { rentalId: RENTAL_ID, result: { artifact: { mime: 'image/png', filename: 'frame.png', base64: png.toString('base64') } } },
+      'https://api.example.com'
+    );
+    const artifact = view.result.artifact;
+    expect(artifact.base64).toBe(png.toString('base64')); // small: still inline for preview
+    const url = new URL(artifact.url);
+    expect(url.origin).toBe('https://api.example.com');
+    expect(url.pathname).toBe(`/api/rentals/${RENTAL_ID}/job/artifact`);
+    const exp = url.searchParams.get('exp');
+    const sig = url.searchParams.get('sig');
+    expect(jobs.artifactLinkValid(RENTAL_ID, exp, sig)).toBe(true);
+    expect(jobs.artifactLinkValid('44444444-4444-4444-8444-444444444444', exp, sig)).toBe(false);
+    expect(jobs.artifactLinkValid(RENTAL_ID, String(Number(exp) - jobs.ARTIFACT_LINK_TTL_SECONDS - 60), sig)).toBe(false);
+    expect(jobs.artifactLinkValid(RENTAL_ID, exp, sig.replace(/^./, sig[0] === 'a' ? 'b' : 'a'))).toBe(false);
+    expect(jobs.artifactLinkValid(RENTAL_ID, 'soon', sig)).toBe(false);
+  });
+
+  test('an artifact larger than the inline budget is served by link only', () => {
+    const big = Buffer.alloc(80 * 1024, 7).toString('base64');
+    expect(big.length).toBeGreaterThan(jobs.INLINE_ARTIFACT_LIMIT);
+    const view = jobs.forRenter({ rentalId: RENTAL_ID, result: { artifact: { mime: 'image/png', base64: big } } });
+    expect(view.result.artifact.base64).toBeUndefined();
+    expect(view.result.artifact.url).toContain('/job/artifact?');
+  });
+
+  test('getArtifact() returns the bytes with a safe filename and mime', async () => {
+    mockState.rows.session_jobs = [queuedJob({
+      status: 'succeeded',
+      result: { artifact: { mime: 'text/html', filename: '../evil"\n.html', base64: png.toString('base64') } }
+    })];
+    const artifact = await jobs.getArtifact(RENTAL_ID);
+    expect(artifact.bytes.equals(png)).toBe(true);
+    expect(artifact.mime).toBe('application/octet-stream');
+    expect(artifact.filename).toBe('.._evil__.html');
+    await expect(jobs.getArtifact('44444444-4444-4444-8444-444444444444')).resolves.toBeNull();
+  });
+});
