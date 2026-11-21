@@ -24,7 +24,9 @@ const AGENT_DIR = path.resolve(__dirname, '../../../worker-agent');
 const API_BASE = process.env.E2E_BASE || 'http://127.0.0.1:5000/api';
 
 let failures = 0;
+let checks = 0;
 const check = (name, ok, detail) => {
+  checks += 1;
   if (!ok) failures += 1;
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
 };
@@ -351,7 +353,7 @@ async function scenario({ name, listing, jobBody, expect }, ids) {
     check('recovery: session ended and settled', ended.status === 200, `${ended.status}`);
   }
 
-  console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL CHECKS PASSED');
+  console.log(failures ? `\n${checks} checks, ${failures} FAILED` : `\nALL ${checks}/${checks} CHECKS PASSED`);
   process.exit(failures ? 1 : 0);
 })().catch((error) => {
   console.error('ERR', error.stack || error.message);
